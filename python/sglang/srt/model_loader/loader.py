@@ -1136,11 +1136,22 @@ class DefaultModelLoader(BaseModelLoader):
             weights = decode_csf_weight_scales(
                 weights, scale_encoding_of=quant_config.scale_encoding_of
             )
-        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
-        if is_mxfp8:
+        quant_name = quant_config.get_name() if quant_config is not None else None
+        if quant_name in ("mxfp8", "modelopt_mixed"):
+            # Only MXFP8 layers rename their ue8m0 block scale onto block-quant's
+            # `weight_scale_inv`; every other algo keeps `weight_scale` real.
             weights = (
                 (
-                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    name + "_inv"
+                    if name.endswith(".weight_scale")
+                    and (
+                        quant_name != "modelopt_mixed"
+                        or quant_config.resolve_quant_algo(
+                            name.removesuffix(".weight_scale")
+                        )
+                        == "MXFP8"
+                    )
+                    else name,
                     loaded_weight,
                 )
                 for name, loaded_weight in weights
