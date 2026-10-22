@@ -2949,6 +2949,10 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
+                # Target verify and the draft extend after it store up to this
+                # many rows per request before compressing
+                # (qsa_pending_ring_size); the backend refuses wider forwards.
+                qsa_max_rows_per_request=max_speculative_num_draft_tokens() or 1,
             )
         if self.modelslim_cache_layout is not None:
             full_pool_class = partial(
