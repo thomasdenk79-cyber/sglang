@@ -99,6 +99,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_PLE_PINNED_HUGEPAGE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With `--ple-offload-backend pinned`, back the PLE table with transparent huge pages page-locked by `cudaHostRegister` (the random-row gather is otherwise bound by address translation). Falls back to the exact-size `cudaHostAlloc` table if the mapping or registration fails. Needs THP in `madvise` or `always` mode</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cap (GiB) on the resident set of the file-backed PLE mapping. A row fault maps a whole page-cache folio, so the mapping otherwise creeps towards the full table and consumes the free memory that sizes the KV pool; over the cap the pages are dropped with `MADV_DONTNEED` and stay in the page cache. Set to `0` to disable</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8.0</code></td>

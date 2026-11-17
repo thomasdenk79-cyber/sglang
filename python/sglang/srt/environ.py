@@ -321,6 +321,9 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # --ple-offload-backend pinned: back the table with transparent huge pages,
+    # page-locked by cudaHostRegister. Opt-in: needs THP (madvise or always).
+    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvBool(False)
     # Faulting rows in maps whole page-cache folios, so the mapping creeps
     # towards full residency (~45 KB/token) and eats the free memory that
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
