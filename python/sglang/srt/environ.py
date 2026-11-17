@@ -1898,6 +1898,12 @@ class Envs:
     # tokens seen in prompts and accepted outputs, shared by all requests
     # (0 disables). Needs tp/pp/dp size 1.
     SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS = EnvInt(0)
+    # Build the Qwen4-Exp MTP draft's embed_tokens / lm_head as one-row
+    # placeholders: the EAGLE worker replaces both with the target's tensors
+    # before the first forward, so the draft's own pair only raises the start-up
+    # peak. Needs pp size 1. The freed memory goes to the KV pool, so a tuned
+    # --mem-fraction-static may have to come down.
+    SGLANG_DRAFT_SKIP_VOCAB_WEIGHTS = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
