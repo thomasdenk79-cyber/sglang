@@ -1398,6 +1398,13 @@ class TestKV4Compatibility(unittest.TestCase):
         )
         self._use_mla_backend_patcher.start()
         self.addCleanup(self._use_mla_backend_patcher.stop)
+        # "dummy" has no model config to inspect; QSA tests patch this to True.
+        qsa_patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.is_qwen_qsa_model",
+            return_value=False,
+        )
+        qsa_patcher.start()
+        self.addCleanup(qsa_patcher.stop)
 
     @staticmethod
     def _make_nvfp4_args(**overrides):
@@ -1614,6 +1621,54 @@ class TestKV4Compatibility(unittest.TestCase):
     def test_nvfp4_rejects_unified_memory(self):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            handle_kv4_compatibility(args)
+
+    def _patch_qsa_model(self):
+        patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.is_qwen_qsa_model",
+            return_value=True,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_qsa_nvfp4_keeps_configured_backends_with_mtp(self):
+        self._patch_qsa_model()
+        args = self._make_unrouted_nvfp4_args(
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+            speculative_draft_kv_cache_dtype="fp8_e4m3",
+        )
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        handle_kv4_compatibility(args)
+        self.assertIsNone(resolution_result(args, "prefill_attention_backend"))
+        self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_qsa_nvfp4_rejects_prefill_dequant_dtype(self):
+        self._patch_qsa_model()
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="fp8_e4m3")
+        with self.assertRaisesRegex(ValueError, "Qwen QSA"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_qsa_nvfp4_fails_closed_for_scale_dropping_paths(self):
+        self._patch_qsa_model()
+        for overrides, flag in (
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+            ({"enable_lmcache": True}, "enable-lmcache"),
+            ({"disaggregation_mode": "decode"}, "disaggregation-mode"),
+        ):
+            with self.subTest(flag=flag):
+                args = self._make_unrouted_nvfp4_args(**overrides)
+                with self.assertRaisesRegex(ValueError, flag):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_qsa_rejects_fp4_mx_block16(self):
+        self._patch_qsa_model()
+        args = ServerArgs(model_path="dummy", kv_cache_dtype="fp4_mx_block16")
+        with self.assertRaisesRegex(ValueError, "not supported for Qwen QSA"):
             handle_kv4_compatibility(args)
 
 

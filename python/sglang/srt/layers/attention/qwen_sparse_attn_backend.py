@@ -25,6 +25,10 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
 )
 from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
+from sglang.srt.layers.attention.qsa.nvfp4_kv import (
+    pack_qsa_prefill_kv_nvfp4,
+    qwen_sparse_kv_extraction_compact_nvfp4_triton,
+)
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
     qsa_sparse_attention,
@@ -47,6 +51,9 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    QSANVFP4KVCacheMethod,
+)
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -1336,6 +1343,11 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def megakernel_pool_view(self) -> QSAPoolView:
         pool = self.token_to_kv_pool
+        if _qsa_nvfp4_quant_method(pool) is not None:
+            raise NotImplementedError(
+                "The NVIDIA megakernel reads plain FP8/BF16 QSA KV; NVFP4 KV is "
+                "not supported there."
+            )
         router = pool.layer_router
         layer_ids = router.layer_ids()
         layers = tuple(router.read(i) for i in layer_ids)
@@ -1663,6 +1675,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
+            _require_plain_qsa_kv(self.token_to_kv_pool, "CPU/NPU attention")
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
@@ -1715,16 +1728,38 @@ class QwenSparseAttnBackend(AttentionBackend):
             req_indices = torch.arange(
                 req_to_token.shape[0], dtype=req_indices.dtype, device=q.device
             )
-        packed_k, packed_v = pack_qsa_prefill_kv(
-            k=pool.layer_router.read(layer.layer_id).key(),
-            v=pool.layer_router.read(layer.layer_id).value(),
-            req_to_token=req_to_token,
-            req_indices=req_indices,
-            cu_k=cu_seqlens_k,
-            total_k=sum(sequence_lens),
-            max_k=max(sequence_lens, default=1),
-            output_dtype=q.dtype,
-        )
+        nvfp4 = _qsa_nvfp4_view(self.token_to_kv_pool, layer)
+        if nvfp4 is not None:
+            if self._kv_shard_pool is not None:
+                raise NotImplementedError(
+                    "QSA NVFP4 KV does not support logical-page KV sharding."
+                )
+            k_raw, v_raw, k_sf, v_sf, k_g, v_g = nvfp4
+            packed_k, packed_v = pack_qsa_prefill_kv_nvfp4(
+                k=k_raw,
+                v=v_raw,
+                k_sf=k_sf,
+                v_sf=v_sf,
+                k_g=k_g,
+                v_g=v_g,
+                req_to_token=req_to_token,
+                req_indices=req_indices,
+                seq_lens=sequence_lens_tensor,
+                cu_k=cu_seqlens_k,
+                total_k=sum(sequence_lens),
+                output_dtype=q.dtype,
+            )
+        else:
+            packed_k, packed_v = pack_qsa_prefill_kv(
+                k=pool.layer_router.read(layer.layer_id).key(),
+                v=pool.layer_router.read(layer.layer_id).value(),
+                req_to_token=req_to_token,
+                req_indices=req_indices,
+                cu_k=cu_seqlens_k,
+                total_k=sum(sequence_lens),
+                max_k=max(sequence_lens, default=1),
+                output_dtype=q.dtype,
+            )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
             packed_k,
@@ -1780,6 +1815,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA prefill CP only supports the zigzag strategy; "
                 f"got {strategy_name}."
             )
+        _require_plain_qsa_kv(self.token_to_kv_pool, "prefill context parallelism")
         meta = forward_batch.attn_cp_metadata
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
@@ -1943,6 +1979,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         trtllm_decode,
         new_kv=None,
+        nvfp4=None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
@@ -1967,19 +2004,25 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
         # TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8 pool stays FP8 here;
-        # validated on SM10x only, SM120 keeps the BF16 scratch.
+        # validated on SM10x only, SM120 keeps the BF16 scratch. NVFP4 rows are
+        # dequantized into the query dtype: block scale x global scale can exceed
+        # the FP8 range.
         packed_dtype = (
             k_buffer.dtype
             if k_buffer.dtype == torch.float8_e4m3fn and is_sm100_supported()
             else q.dtype
         )
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = k_buffer.shape[2] * 2 if nvfp4 is not None else k_buffer.shape[2]
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            num_kv_heads,
+            head_dim,
             packed_dtype,
             k_buffer.device,
         )
+        if nvfp4 is not None and new_kv is not None:
+            raise NotImplementedError("fused K/V prepare does not support NVFP4 KV")
         if new_kv is not None:
             k, v, loc, width = new_kv
             row_requests = metadata.row_req_pool_indices
@@ -2013,26 +2056,42 @@ class QwenSparseAttnBackend(AttentionBackend):
             qwen_sparse_valid_counts_triton(
                 sequence_lens, topk_indices, valid_counts, batch, topk
             )
-            qwen_sparse_kv_extraction_compact_triton(
-                k_buffer,
-                v_buffer,
-                self.req_to_token_pool.req_to_token,
-                (
-                    metadata.row_req_pool_indices
-                    if metadata.row_req_pool_indices is not None
-                    else forward_batch.req_pool_indices
-                ),
-                topk_indices,
-                sequence_lens,
-                cu_strided,
-                packed_k,
-                packed_v,
-                batch,
-                topk,
-                zero_fill_cols=stride,
+            row_requests = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
             )
-        num_kv_heads = k_buffer.shape[1]
-        head_dim = k_buffer.shape[2]
+            if nvfp4 is not None:
+                qwen_sparse_kv_extraction_compact_nvfp4_triton(
+                    k_buffer,
+                    v_buffer,
+                    *nvfp4,
+                    self.req_to_token_pool.req_to_token,
+                    row_requests,
+                    topk_indices,
+                    sequence_lens,
+                    cu_strided,
+                    packed_k,
+                    packed_v,
+                    batch,
+                    topk,
+                    zero_fill_cols=stride,
+                )
+            else:
+                qwen_sparse_kv_extraction_compact_triton(
+                    k_buffer,
+                    v_buffer,
+                    self.req_to_token_pool.req_to_token,
+                    row_requests,
+                    topk_indices,
+                    sequence_lens,
+                    cu_strided,
+                    packed_k,
+                    packed_v,
+                    batch,
+                    topk,
+                    zero_fill_cols=stride,
+                )
         kc = (
             packed_k[: batch * stride]
             .view(-1, page, num_kv_heads, head_dim)
@@ -2105,11 +2164,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.layer_router.read(layer.layer_id).key()
-        v_buffer = pool.layer_router.read(layer.layer_id).value()
+        nvfp4 = _qsa_nvfp4_view(self.token_to_kv_pool, layer)
+        if nvfp4 is not None:
+            k_buffer, v_buffer = nvfp4[0], nvfp4[1]
+            nvfp4_scales = nvfp4[2:]
+            # Logical (dequantized) geometry of the packed-FP4 rows.
+            kv_heads, kv_head_dim = k_buffer.shape[1], k_buffer.shape[2] * 2
+        else:
+            k_buffer = pool.layer_router.read(layer.layer_id).key()
+            v_buffer = pool.layer_router.read(layer.layer_id).value()
+            nvfp4_scales = None
+            kv_heads, kv_head_dim = k_buffer.shape[1], k_buffer.shape[2]
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
         if _is_npu or not q.is_cuda:
+            _require_plain_qsa_kv(self.token_to_kv_pool, "CPU/NPU attention")
             slots = self._logical_to_physical(topk_indices, metadata)
             if _is_npu:
                 attention = _npu_sparse_attention
@@ -2146,6 +2215,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+                nvfp4=nvfp4_scales,
             )
 
         batch, topk = topk_indices.shape
@@ -2175,28 +2245,45 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            kv_heads,
+            kv_head_dim,
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_seqlens_k,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
+        row_requests = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
         )
+        if nvfp4_scales is not None:
+            qwen_sparse_kv_extraction_compact_nvfp4_triton(
+                k_buffer,
+                v_buffer,
+                *nvfp4_scales,
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
+        else:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
         if is_hip():
             relative_indices = torch.arange(
                 topk, dtype=torch.int32, device=q.device
@@ -2229,6 +2316,42 @@ class QwenSparseAttnBackend(AttentionBackend):
             causal=True,
         )
         return output.reshape(q.shape[0], -1)
+
+
+def _qsa_nvfp4_quant_method(pool):
+    getter = getattr(pool, "get_kv_cache_quant_method", None)
+    quant_method = getter() if callable(getter) else None
+    return quant_method if isinstance(quant_method, QSANVFP4KVCacheMethod) else None
+
+
+def _qsa_nvfp4_view(pool, layer):
+    """Raw NVFP4 view ``(k, v, k_sf, v_sf, k_global, v_global)`` of ``layer``'s
+    KV, or None for a plain FP8/BF16 pool.
+
+    Looked up per call: frozen-KV MTP swaps the backend's pool. The global scales
+    are device slices (indexed by model layer id), so CUDA graph capture reads
+    them in place instead of baking host floats into the graph."""
+    quant_method = _qsa_nvfp4_quant_method(pool)
+    if quant_method is None:
+        return None
+    k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+    lid = layer.layer_id
+    return (
+        k,
+        v,
+        k_sf,
+        v_sf,
+        quant_method.k_scales_gpu[lid : lid + 1],
+        quant_method.v_scales_gpu[lid : lid + 1],
+    )
+
+
+def _require_plain_qsa_kv(pool, path: str) -> None:
+    if _qsa_nvfp4_quant_method(pool) is not None:
+        raise NotImplementedError(
+            f"QSA {path} does not support NVFP4 KV; use --kv-cache-dtype "
+            "fp8_e4m3 for it."
+        )
 
 
 class QwenSparseMultiStepDraftBackend:
