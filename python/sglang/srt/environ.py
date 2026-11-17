@@ -1684,6 +1684,9 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Qwen4-Exp hyper-connections: also overlap the combine gate on a side
+    # stream on SM120 (RTX PRO 6000); SM100 always does.
+    SGLANG_OPT_HC_GATE_STREAM_SM120 = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE
