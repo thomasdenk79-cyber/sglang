@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import time
 from enum import Enum
@@ -113,6 +114,34 @@ if _use_aiter:
 _use_tlx_gemm = _is_gfx95 and envs.SGLANG_USE_TLX_GEMM.get()
 if _use_tlx_gemm:
     from sglang.kernels.ops.gemm import tlx as tlx_gemm
+
+if _is_cuda:
+    from sglang.kernels.ops.gemm.sm120_bf16_skinny_gemv import (
+        bf16_skinny_gemv_applies,
+        bf16_skinny_linear,
+        is_sm120,
+    )
+
+
+@functools.cache
+def _use_sm120_bf16_skinny_gemv() -> bool:
+    return _is_cuda and envs.SGLANG_SM120_BF16_SKINNY_GEMV.get() and is_sm120()
+
+
+def maybe_sm120_bf16_skinny_linear(
+    x: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``F.linear(x, weight)`` via the sm_120 skinny GEMV, or None if it does not apply."""
+    if (
+        not _use_sm120_bf16_skinny_gemv()
+        or torch.compiler.is_compiling()
+        # The split-K order depends on the batch size.
+        or is_batch_invariant_mode_enabled()
+        or not bf16_skinny_gemv_applies(x, weight)
+    ):
+        return None
+    return bf16_skinny_linear(x, weight)
+
 
 if _rowmajor_ok:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
@@ -1038,6 +1067,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         tiled = getattr(layer, "small_m_tiled_weight", None)
         if tiled is not None and bias is None and tiled_gemm_applies(x, tiled):
             return tiled_gemm(x, tiled, *layer.weight.shape)
+        if bias is None:
+            out = maybe_sm120_bf16_skinny_linear(x, layer.weight)
+            if out is not None:
+                return out
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

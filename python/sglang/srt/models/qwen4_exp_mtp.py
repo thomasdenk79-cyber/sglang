@@ -14,6 +14,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import maybe_sm120_bf16_skinny_linear
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,6 +34,12 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _fc(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """The MTP fc_embedding/fc_hidden projection (bias-free BF16 nn.Linear)."""
+    out = maybe_sm120_bf16_skinny_linear(x, linear.weight)
+    return linear(x) if out is None else out
 
 
 def _draft_vocab_weights_are_shared(config: PretrainedConfig) -> bool:
@@ -241,13 +248,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def _fuse_residual_linear_shared(
         self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
+        input_embeds = _fc(self.fc_embedding, self.pre_fc_norm_embedding(input_embeds))
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         decoder_view = hidden_states.view(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
-        encoder_inputs = self.fc_hidden(decoder_view)
+        encoder_inputs = _fc(self.fc_hidden, decoder_view)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(
