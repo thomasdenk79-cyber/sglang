@@ -47,6 +47,8 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
+    QSANVFP4KVCacheMethod,
+    UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import (
@@ -430,6 +432,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+        # For Qwen QSA models attn_backend_wrapper builds this backend and then
+        # replaces it with QwenSparseAttnBackend, which reads NVFP4 KV through its
+        # own gathers; this instance never reads the cache.
+        qsa_nvfp4_placeholder = isinstance(
+            self.kv_cache_quant_method, QSANVFP4KVCacheMethod
+        )
+        if qsa_nvfp4_placeholder:
+            self.kv_cache_quant_method = UnquantizedKVCacheMethod()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "flashinfer"
         )
@@ -470,6 +480,8 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             else model_runner.kv_cache_dtype
         )
+        if qsa_nvfp4_placeholder:
+            self.flashinfer_kv_cache_dtype = torch.float8_e4m3fn
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(

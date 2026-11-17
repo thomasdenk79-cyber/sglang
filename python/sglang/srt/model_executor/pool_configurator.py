@@ -622,8 +622,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
+                from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
                 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
                     get_kv_cache_quant_method,
+                    get_qsa_kv_cache_quant_method,
                     resolve_kv_cache_quant,
                 )
 
@@ -632,7 +634,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     raise ValueError(
                         "FP4 storage dtype requires an explicit KV recipe name."
                     )
-                quant_method = get_kv_cache_quant_method(
+                # Same recipe class as KVCacheConfigurator._build_fp4_quant_method.
+                factory = (
+                    get_qsa_kv_cache_quant_method
+                    if is_qwen_qsa(model_config.hf_config)
+                    else get_kv_cache_quant_method
+                )
+                quant_method = factory(
                     quant_name,
                     num_layers=effective_num_layers,
                     device=kvc.device,

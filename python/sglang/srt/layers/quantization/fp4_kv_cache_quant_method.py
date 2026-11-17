@@ -768,6 +768,61 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         return fp4_size + scale_size + dq_size
 
 
+class QSANVFP4KVCacheMethod(NVFP4KVCacheMethod):
+    """NVFP4 KV for Qwen QSA pools.
+
+    QSA never hands the pool to an attention kernel: its top-k and prefix gathers
+    dequantize NVFP4 rows on the way (``layers/attention/qsa/nvfp4_kv.py``). The
+    pool therefore stores packed E2M1 data plus token-linear E4M3 block scales
+    only, without the full-size dequant workspace or the SM100 native scale
+    layout the generic recipe allocates for FlashInfer/TRT-LLM MHA.
+    """
+
+    def configure_attention_backends(
+        self, prefill_backend: str, decode_backend: str
+    ) -> None:
+        # The QSA backend replaces whatever full-attention backend is configured.
+        self._active_attention_accesses = ()
+
+    def has_native_fp4_access(self) -> bool:
+        return False
+
+    def needs_native_fp4_scales(self) -> bool:
+        return False
+
+    def needs_linear_scale_buffer(self) -> bool:
+        return True
+
+    def needs_dequant_workspace(self) -> bool:
+        return False
+
+    def dequant_workspace_dtype(self) -> Optional[torch.dtype]:
+        return None
+
+    def needs_plain_kv_dequant_read(self) -> bool:
+        # Route every plain key()/value() read to dequantize_kv_tensor, which
+        # fails loudly instead of handing packed bytes to a kernel.
+        return True
+
+    def dequantize_kv_tensor(self, fp4_tensor, scales, layer_id, dtype=None):
+        raise NotImplementedError(
+            "QSA NVFP4 KV has no plain key()/value() read; read it through the "
+            "dequantizing gathers in layers/attention/qsa/nvfp4_kv.py."
+        )
+
+    def ensure_global_scale_rows(self, num_rows: int) -> None:
+        """Global scales are indexed by model layer id; QSA layer ids exceed the
+        number of full-attention layers the method was sized for."""
+        if num_rows <= len(self.k_scales_gpu):
+            return
+        extra = num_rows - len(self.k_scales_gpu)
+        ones = torch.ones(extra, dtype=torch.float32, device=self.k_scales_gpu.device)
+        self.k_scales_gpu = torch.cat([self.k_scales_gpu, ones])
+        self.v_scales_gpu = torch.cat([self.v_scales_gpu, ones.clone()])
+        self.k_scales_float.extend([1.0] * extra)
+        self.v_scales_float.extend([1.0] * extra)
+
+
 class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     """Block-16 FP4 E2M1 single-level scaling.
 
@@ -1018,6 +1073,24 @@ KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
     "nvfp4": NVFP4KVCacheMethod,
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
 }
+
+
+# QSA pools gather and dequantize KV themselves; recipes without a QSA reader
+# are absent and fail fast.
+QSA_KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
+    "nvfp4": QSANVFP4KVCacheMethod,
+}
+
+
+def get_qsa_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethodBase:
+    """The KV quant method of a Qwen QSA pool for ``--kv-cache-dtype=name``."""
+    cls = QSA_KV_CACHE_QUANT_REGISTRY.get(name)
+    if cls is None:
+        raise ValueError(
+            f"--kv-cache-dtype={name} is not supported for Qwen QSA models; "
+            f"supported FP4 recipes: {sorted(QSA_KV_CACHE_QUANT_REGISTRY)}."
+        )
+    return cls(**kwargs)
 
 
 def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:

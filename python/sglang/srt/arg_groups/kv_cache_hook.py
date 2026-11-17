@@ -34,6 +34,14 @@ _NVFP4_PREFILL_DEQUANT_DTYPE = {
 }
 
 
+def is_qwen_qsa_model(server_args: Any) -> bool:
+    """Whether the served model is a Qwen compressed-QSA model, whose sparse
+    backend owns every full-attention KV read."""
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    return is_qwen_qsa(getattr(model_config_of(server_args), "hf_config", None))
+
+
 def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     """Resolve the public prefill dequantization dtype to attention backends."""
 
@@ -45,6 +53,18 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                 "--prefill-kv-cache-dequant-dtype applies only with "
                 "--kv-cache-dtype=nvfp4."
             )
+        return
+
+    if is_qwen_qsa_model(server_args):
+        # QwenSparseAttnBackend replaces the configured full-attention backend
+        # and dequantizes NVFP4 rows in its own gathers; there is no prefill
+        # workspace or native-NVFP4 backend to route to.
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dequant-dtype does not apply to Qwen QSA "
+                "models: the QSA backend dequantizes NVFP4 KV in its gathers."
+            )
+        logger.info("NVFP4 KV on Qwen QSA: read through the QSA NVFP4 gathers.")
         return
 
     if requested_dtype == "auto":
@@ -177,6 +197,10 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "the unified MHA pool does not allocate FP4 block scales or "
                 "the prefill dequant workspace."
             )
+
+        if is_qwen_qsa_model(server_args):
+            _check_qsa_kv4_compatibility(cfg)
+            return
 
         # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
         # transfer and host-tier pools do not preserve that layout yet. Keep
@@ -358,6 +382,38 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                     )
     else:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
+
+def _check_qsa_kv4_compatibility(cfg: Any) -> None:
+    """FP4 KV on a Qwen QSA pool: NVFP4 only, on the paths that preserve its
+    block scales; every other combination fails closed."""
+    if cfg.kv_cache_dtype != "nvfp4":
+        raise ValueError(
+            f"--kv-cache-dtype={cfg.kv_cache_dtype} is not supported for Qwen QSA "
+            "models; use --kv-cache-dtype=nvfp4 or fp8_e4m3."
+        )
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
+            ("--enable-lmcache", cfg.enable_lmcache),
+            ("--attn-cp-size > 1", (cfg.attn_cp_size or 1) > 1),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            "NVFP4 KV on Qwen QSA models does not support "
+            f"{', '.join(unsupported)}: those paths do not carry the NVFP4 "
+            "block scales of the QSA pool. Disable them or use "
+            "--kv-cache-dtype=fp8_e4m3."
+        )
+    if envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get():
+        logger.warning(
+            "SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA reads FP8/BF16 KV only; with "
+            "NVFP4 KV the QSA backend uses its dequantizing TRT-LLM decode path."
+        )
 
 
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:

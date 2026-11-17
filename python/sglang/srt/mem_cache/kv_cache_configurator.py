@@ -43,6 +43,7 @@ from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
+    get_qsa_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -562,7 +563,15 @@ class KVCacheConfigurator:
         quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
         if quant_name is None:
             return None
-        quant_method = get_kv_cache_quant_method(
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        # QSA pools are read only through the QSA backend's dequantizing gathers.
+        factory = (
+            get_qsa_kv_cache_quant_method
+            if is_qwen_qsa(self.model_config.hf_config)
+            else get_kv_cache_quant_method
+        )
+        quant_method = factory(
             quant_name,
             num_layers=num_layers,
             device=self.device,
@@ -2911,6 +2920,14 @@ class KVCacheConfigurator:
             extra_args["use_mla"] = self.use_mla_backend
         else:
             pool_class = QSATokenToKVPool
+            if (
+                hasattr(quant_method, "ensure_global_scale_rows")
+                and full_attention_layer_ids
+            ):
+                # Writes index the global scales by model layer id.
+                quant_method.ensure_global_scale_rows(
+                    max(full_attention_layer_ids) + 1
+                )
             extra_args.update(
                 qsa_index_kv_heads=qsa_profile.kv_heads,
                 qsa_index_head_dim=qsa_profile.head_dim,
