@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -15,6 +16,11 @@ from sglang.srt.layers.hc_mix_flydsl import (
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+
+
+def _hc_gate_stream_supported() -> bool:
+    major = torch.cuda.get_device_capability()[0]
+    return major == 10 or (major == 12 and envs.SGLANG_OPT_HC_GATE_STREAM_SM120.get())
 
 
 @lru_cache(None)
@@ -209,7 +215,7 @@ class GatedResidual(HyperConnectionBase):
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
                 and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] == 10
+                and _hc_gate_stream_supported()
             ):
                 # Create before graph capture; all layers on a device share it.
                 self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
