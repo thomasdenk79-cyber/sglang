@@ -170,6 +170,7 @@ def build_fixture(
             mamba_layer_ids=cfg.non_full_layer_ids,
             enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=cfg.enable_mamba_extra_buffer_lazy,
+            enable_linear_replayssm=cfg.enable_linear_replayssm,
             speculative_num_draft_tokens=3,
             enable_overlap_schedule=cfg.enable_overlap_schedule,
         )

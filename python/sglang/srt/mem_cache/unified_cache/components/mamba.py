@@ -1056,14 +1056,12 @@ class MambaComponent(TreeComponent):
             cache_len = req.kv.mamba_last_track_seqlen
         else:
             cache_len = token_ids_len
-            # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
-            # slot's unflushed ring depth (`write_pos`), so on request finish cap
-            # the donate to the last flush boundary (where temporal is current)
-            # and reset the cursor, keeping the donated checkpoint consistent with
-            # its key length. page_size is asserted == 1, so no realign.
+            # ReplaySSM advances conv every step but temporal only on a flush.
+            # Shortening the key cannot rewind conv to the temporal checkpoint.
             if is_finished:
                 storage, sub_pool = self._state()
-                cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
+                if storage.settle_replay(sub_pool, req.kv.mamba_pool_idx) != 0:
+                    return 0
 
         if is_finished:
             if cache_len is None:
