@@ -1421,6 +1421,9 @@ class Envs:
     SGLANG_TRTLLM_MLA_WORKSPACE_MB = EnvInt(_k31_gb_best(256, 150))
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Route the BF16 skinny linears (MoE router gate, MTP fc) at M <= 16 to the
+    # split-K Triton GEMV tuned for sm_120 instead of cuBLAS.
+    SGLANG_SM120_BF16_SKINNY_GEMV = EnvBool(False)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS
