@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -1093,6 +1093,34 @@ def _gather_ple_nvfp4_embedding_kernel(
         tl.where(in_range, decoded, 0.0),
         mask=mask,
     )
+
+
+def check_nvfp4_ple_complete(
+    mod_prefix: str,
+    org_vocab_size: int,
+    num_sync_shards: int,
+    loaded_shards: Dict[str, Set[int]],
+    has_global_scale: bool,
+) -> None:
+    """Raise unless every NVFP4 PLE shard's codes and block scales and the
+    global scale were loaded: the host table starts uninitialized, so a
+    missing shard would otherwise serve garbage rows."""
+    shard_size = (org_vocab_size + num_sync_shards - 1) // num_sync_shards
+    expected = set(range((org_vocab_size + shard_size - 1) // shard_size))
+    problems = []
+    for suffix in ("weight", "weight_scale"):
+        missing = sorted(expected - loaded_shards.get(suffix, set()))
+        if missing:
+            problems.append(
+                f"{len(missing)}/{len(expected)} {suffix} shards missing "
+                f"(first: {missing[:8]})"
+            )
+    if not has_global_scale:
+        problems.append("weight_scale_2 missing")
+    if problems:
+        raise ValueError(
+            f"Incomplete NVFP4 PLE checkpoint for {mod_prefix}: " + "; ".join(problems)
+        )
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
@@ -3021,6 +3049,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 else "weight",
             )
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.{suffix}")
+            if nvfp4:
+                nvfp4_ple_shards.setdefault(mod_prefix, {}).setdefault(
+                    suffix, set()
+                ).add(shard_idx)
             return True
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -3042,6 +3074,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         loaded_buffers: Set[str] = set()
         loaded_shard_params: Set[str] = set()
+        # NVFP4 PLE: shard indices loaded per module and suffix.
+        nvfp4_ple_shards: Dict[str, Dict[str, Set[int]]] = {}
         skipped_visual_count = 0
 
         for name, loaded_weight in weights:
@@ -3219,6 +3253,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
+
+        for mod_prefix, shards in nvfp4_ple_shards.items():
+            check_nvfp4_ple_complete(
+                mod_prefix,
+                ple_modules[mod_prefix].ngram_embedding.org_vocab_size,
+                ple_num_sync_shards,
+                shards,
+                f"{mod_prefix}.ngram_embedding.weight_scale_2" in loaded_buffers,
+            )
 
         if skipped_visual_count > 0:
             logger.info(
