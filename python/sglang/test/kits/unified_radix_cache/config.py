@@ -35,6 +35,7 @@ class CacheConfig:
     mamba_conv_kernel: int = 4
     enable_int8_mamba_checkpoint: bool = False
     hybrid_cache_checkpoints_level: int = 3
+    enable_linear_replayssm: bool = False
 
     kv_size: int = 256
     max_num_reqs: int = 10
