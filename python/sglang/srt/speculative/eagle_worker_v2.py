@@ -76,6 +76,7 @@ from sglang.srt.speculative.draft_parallel import (
     resolve_draft_parallel_layout,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.dynamic_draft_vocab import DynamicDraftVocab
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -411,7 +412,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
+        self.dynamic_vocab = None
+        if envs.SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS.get() > 0 and (
+            self.speculative_algorithm.is_eagle3() or self.hot_token_id is None
+        ):
+            raise ValueError(
+                "SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS needs --speculative-token-map "
+                "and is not supported for EAGLE3."
+            )
         embed, head = self._resolve_shared_embed_and_head()
+        if envs.SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS.get() > 0 and head is None:
+            raise ValueError(
+                "SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS needs the draft to share the "
+                "target LM head."
+            )
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -445,13 +459,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                head = self._init_hot_head(head)
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+            if self.dynamic_vocab is not None:
+                draft_lm_head = getattr(self.draft_runner.model, "lm_head", None)
+                if (
+                    getattr(draft_lm_head, "weight", None) is None
+                    or draft_lm_head.weight.data_ptr() != head.data_ptr()
+                ):
+                    raise ValueError(
+                        "SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS needs a draft model that "
+                        "uses the sliced draft head in place; "
+                        f"{type(self.draft_runner.model).__name__} does not."
+                    )
+
+    def _init_hot_head(self, head: torch.Tensor) -> torch.Tensor:
+        num_slots = envs.SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS.get()
+        if num_slots <= 0:
+            head = head.clone()
+            self.hot_token_id = self.hot_token_id.to(head.device)
+            head.data = head.data[self.hot_token_id]
+            return head
+        server_args = self.server_args
+        if (
+            server_args.tp_size != 1
+            or server_args.pp_size != 1
+            or server_args.dp_size != 1
+            or server_args.enable_dp_attention
+        ):
+            # Each rank would grow its own ring and draft different tokens.
+            raise ValueError(
+                "SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS supports tp_size, pp_size and "
+                "dp_size 1 only."
+            )
+        dynamic_vocab = DynamicDraftVocab(
+            self.hot_token_id,
+            head,
+            num_slots,
+            self.target_worker.model_config.vocab_size,
+        )
+        self.dynamic_vocab = dynamic_vocab
+        self.hot_token_id = dynamic_vocab.hot_token_id
+        logger.info(
+            f"Dynamic draft vocabulary: {dynamic_vocab.num_hot} static + "
+            f"{num_slots} ring tokens."
+        )
+        return dynamic_vocab.head
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
@@ -1118,6 +1174,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 slots.
         """
         self.draft_runtime.note_draft_extend()
+        if self.dynamic_vocab is not None and not batch.forward_mode.is_idle():
+            # Committed at the next decode draft extend; see DynamicDraftVocab.
+            self.dynamic_vocab.stage(batch.input_ids)
+            self.dynamic_vocab.stage(next_token_ids)
         if self.can_split_prefill_draft_extend and should_split_prefill_draft_extend(
             batch,
             mm_input_embeds=mm_input_embeds,
@@ -1353,6 +1413,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             c.with_active_single_forward_manager(0),
         )
 
+    def _commit_dynamic_vocab(self, batch_result: GenerationBatchResult) -> None:
+        # This round's draft probabilities are already in the target vocab, and
+        # the draft extend below computes the next ones with the updated ring.
+        accepted = batch_result.next_token_ids.reshape(
+            -1, self.speculative_num_draft_tokens
+        )
+        accept_lens = batch_result.accept_lens.to(accepted.device)
+        lanes = torch.arange(accepted.shape[1], device=accepted.device)
+        self.dynamic_vocab.stage(accepted, lanes < accept_lens.unsqueeze(1))
+        self.dynamic_vocab.commit()
+
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
@@ -1373,6 +1444,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         iteration_ids: Optional[IterationIds] = None,
     ):
         self.draft_runtime.note_draft_extend()
+        if self.dynamic_vocab is not None and not batch.forward_mode.is_idle():
+            self._commit_dynamic_vocab(batch_result)
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1794,6 +1867,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
+                if (
+                    self.draft_worker.dynamic_vocab is not None
+                    and not batch.forward_mode.is_idle()
+                ):
+                    self.draft_worker._commit_dynamic_vocab(batch_output)
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
                 with (

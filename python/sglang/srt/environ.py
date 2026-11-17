@@ -1906,6 +1906,10 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # FIFO ring slots appended to a --speculative-token-map draft head for non-hot
+    # tokens seen in prompts and accepted outputs, shared by all requests
+    # (0 disables). Needs tp/pp/dp size 1.
+    SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS = EnvInt(0)
     # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
