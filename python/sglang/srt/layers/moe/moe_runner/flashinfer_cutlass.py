@@ -329,6 +329,39 @@ def _flashinfer_autotune_active() -> bool:
     return AutoTuner.get().is_tuning_mode
 
 
+def _maybe_prune_singleton_routes(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    runner_config: MoeRunnerConfig,
+    enable_alltoall: bool,
+) -> None:
+    from sglang.kernels.ops.moe.prune_singleton import (
+        get_prune_config,
+        maybe_prune_singleton_routes_,
+    )
+
+    config = get_prune_config()
+    if not config.enabled:
+        return
+    # Expert ids must be global and the -1 sentinel must reach a kernel that
+    # skips it: the relu2 SM120 MMA path is not verified for that.
+    if (
+        enable_alltoall
+        or runner_config.moe_ep_size != 1
+        or runner_config.moe_tp_size != 1
+        or runner_config.activation == "relu2"
+        or runner_config.num_experts is None
+    ):
+        return
+    num_shared = runner_config.num_fused_shared_experts or 0
+    # Over-estimates for models whose num_experts already counts the shared
+    # slots; the bound only has to cover every id.
+    num_slots = runner_config.num_experts + num_shared
+    maybe_prune_singleton_routes_(
+        topk_ids, topk_weights, num_slots, config, num_shared_cols=num_shared
+    )
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -344,6 +377,9 @@ def _run_flashinfer_cutlass(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights.to(torch.float32)
     topk_ids = topk_output.topk_ids
+    _maybe_prune_singleton_routes(
+        topk_ids, topk_weights, runner_config, enable_alltoall
+    )
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )

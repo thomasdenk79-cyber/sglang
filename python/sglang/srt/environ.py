@@ -1421,6 +1421,18 @@ class Envs:
     SGLANG_TRTLLM_MLA_WORKSPACE_MB = EnvInt(_k31_gb_best(256, 150))
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Lossy, opt-in: drop small-batch MoE routes that are the only route to
+    # their expert in the call and weigh less than TAU, saving that expert's
+    # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS
+    # and MAX_ROWS bound the batch sizes it touches. KEEP_IDS zeroes the weight
+    # but keeps the id (equivalence control without the GEMM saving). RENORM
+    # restores a pruned row's routed weight sum.
+    SGLANG_MOE_PRUNE_SINGLETON_TAU = EnvFloat(0.0)
+    SGLANG_MOE_PRUNE_MIN_RANK = EnvInt(1)
+    SGLANG_MOE_PRUNE_MIN_ROWS = EnvInt(2)
+    SGLANG_MOE_PRUNE_MAX_ROWS = EnvInt(64)
+    SGLANG_MOE_PRUNE_RENORM = EnvBool(False)
+    SGLANG_MOE_PRUNE_KEEP_IDS = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
