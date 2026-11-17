@@ -25,6 +25,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         worker.topk = 1
         worker.use_fused_draft_sample = False
         worker.device = torch.device("cpu")
+        worker.dynamic_vocab = None
 
         logits_output = SimpleNamespace(
             next_token_logits=torch.zeros(8, 16), hidden_states=None
@@ -90,6 +91,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         worker.seed_dsa_topk_from_draft_extend = False
         worker.topk = 1
         worker.device = torch.device("cpu")
+        worker.dynamic_vocab = None
         # a fresh output per forward: the extend reassigns its fields
         forward = lambda _: SimpleNamespace(logits_output=SimpleNamespace(**vars(out)))
         worker.draft_runner = SimpleNamespace(canary_manager=None, forward=forward)
