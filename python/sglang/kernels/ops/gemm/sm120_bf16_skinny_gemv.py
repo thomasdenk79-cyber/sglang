@@ -6,10 +6,11 @@
 # `_store_split`, `_w8a16_gemv_kernel`, `_plan`, `_fit` and the tables are
 # unchanged except the counter reset, now an atomic exchange like the in-tree
 # router_gemv / lora_a fixups. Deviations: only the BF16 entry point is exposed;
-# PDL is not wired (USE_PDL stays False); the split-K scratch is keyed by
-# (device, stream) instead of the donor's manual slot, and a scratch miss during
-# graph capture falls back to the caller's GEMM instead of allocating in the
-# graph pool.
+# PDL is wired through ``sglang.kernels.triton_pdl`` (``USE_PDL`` and
+# ``launch_pdl`` both follow ``SGLANG_TRITON_PDL``, default off); the split-K
+# scratch is keyed by (device, stream) instead of the donor's manual slot, and
+# a scratch miss during graph capture falls back to the caller's GEMM instead
+# of allocating in the graph pool.
 """Triton skinny GEMM for small decode/verify batches (M <= 16) on SM120.
 
 y[M, N] = x[M, K] @ W[N, K]^T with bf16 x and W, fp32 accumulation and bf16
@@ -38,15 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def pdl_wait(USE_PDL: tl.constexpr):
-    pass
-
-
-@triton.jit
-def pdl_trigger(USE_PDL: tl.constexpr):
-    pass
+from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
 
 
 @triton.jit
@@ -530,7 +523,8 @@ def _launch(
         EVEN_K=K % block_k == 0,
         W_KN=(w.stride(0) == 1) if w_kn is None else w_kn,
         USE_DOT=use_dot,
-        USE_PDL=False,
+        USE_PDL=PDL,
+        launch_pdl=PDL,
         SEG_NB0=seg_nb0,
         NORM_G=norm_g,
         NORM_SIGMOID=norm_sigmoid,

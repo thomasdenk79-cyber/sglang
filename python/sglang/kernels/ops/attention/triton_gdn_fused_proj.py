@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import _gdn_gating_values
+from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
@@ -180,8 +181,12 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
     V_POW2: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
+    # mixed_qkvz/mixed_ba are the preceding GEMM's output; everything below
+    # is dependent, so the wait only hides this kernel's scheduling ramp.
+    pdl_wait(USE_PDL)
 
     V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
 
@@ -268,6 +273,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         )
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+    pdl_trigger(USE_PDL)
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(
@@ -336,8 +342,10 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         head_qk,
         head_v,
         V_POW2=(v_per_group & (v_per_group - 1)) == 0,
+        USE_PDL=PDL,
         num_warps=num_warps,
         num_stages=3,
+        launch_pdl=PDL,
     )
     return mixed_qkv, z, b, a
 

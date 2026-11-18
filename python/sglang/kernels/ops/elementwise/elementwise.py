@@ -4,6 +4,7 @@ import triton.language as tl
 from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.triton_pdl import PDL as _TRITON_PDL
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
@@ -25,6 +26,7 @@ def _fused_sigmoid_mul_kernel(
     QUANT: tl.constexpr = False,
     ROUND_SIGMOID: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
+    GDC_TRIGGER: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     if USE_PDL:
@@ -54,6 +56,9 @@ def _fused_sigmoid_mul_kernel(
         tl.store(s_ptr + pid_row, y_s)
     else:
         tl.store(output_ptr + attn_off, result, mask=mask)
+    # Release the PDL-launched successor once every store is issued.
+    if GDC_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_sigmoid_mul(
@@ -125,6 +130,7 @@ def fused_sigmoid_mul(
         BLOCK_H=block_h,
         ROUND_SIGMOID=round_sigmoid,
         USE_PDL=use_pdl,
+        GDC_TRIGGER=_TRITON_PDL,
         num_warps=4,
         **kwargs,
         **pdl_kwargs,
