@@ -481,6 +481,21 @@ class TestFlagOff(unittest.TestCase):
         pipeline._backup_oversize.return_value = False
         self.assertFalse(pipeline._defer_oversize_split(6, intents))
 
+    def test_oversize_backup_without_split_support_warns_once(self):
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline._cache = SimpleNamespace(tree_core=SimpleNamespace(), page_size=4)
+        pipeline._oversize_splits = {}
+        pipeline._warned_no_split = False
+        pipeline._backup_oversize = MagicMock(return_value=True)
+        intents = [(PoolName.KV, ["a", "b"])]
+        with self.assertLogs(
+            "sglang.srt.mem_cache.buffer_mode.pipeline", level="WARNING"
+        ) as logs:
+            self.assertFalse(pipeline._defer_oversize_split(5, intents))
+            self.assertFalse(pipeline._defer_oversize_split(6, intents))
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(pipeline._oversize_splits, {})
+
 
 class TestSplitForBackup(unittest.TestCase):
     def test_split_keeps_tail_id_and_hash_chain(self):

@@ -373,6 +373,7 @@ class BufferModePipeline:
         self._streams: dict[int, BufferStreamPlan] = {}
         # Nodes whose oversize backup splits at the next flush (ordered set).
         self._oversize_splits: dict[NodeId, None] = {}
+        self._warned_no_split = False
         self._stream_last_tick: Optional[float] = None
         self._stream_baseline_step_s = 0.0
         self._staged_admission_defers: dict[CacheRequestHandle, int] = {}
@@ -833,9 +834,22 @@ class BufferModePipeline:
         change during the insert walk that called us). The node's every pool
         waits, so its state pools still follow the KV of the whole span."""
         kv_keys = dict(intents).get(PoolName.KV)
-        if not kv_keys or not hasattr(self._cache.tree_core, "split_for_backup"):
+        if not kv_keys:
             return False
         if not self._backup_oversize(*self._sizing(PoolName.KV, kv_keys)):
+            return False
+        if not hasattr(self._cache.tree_core, "split_for_backup"):
+            if not self._warned_no_split:
+                self._warned_no_split = True
+                logger.warning(
+                    "HiCache buffer backup of node=%s exceeds the host pool, but "
+                    "TreeCore %s cannot split it (no split_for_backup): the span "
+                    "is not backed up. Use the Python TreeCore "
+                    "(SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python) for "
+                    "streamed restores.",
+                    node_id,
+                    type(self._cache.tree_core).__name__,
+                )
             return False
         self._oversize_splits[node_id] = None
         return True
