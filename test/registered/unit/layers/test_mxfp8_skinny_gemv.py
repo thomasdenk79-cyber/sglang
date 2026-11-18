@@ -18,7 +18,7 @@ import torch
 from sglang.srt.layers.quantization import mxfp8_skinny_gemv as g
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+register_cpu_ci(est_time=300, suite="base-a-test-cpu")
 
 # (name, N, K, layers) as the model builds them. Spelling out the fused cases
 # from the checkpoint headers of /srv/llm-models/Qwen3.8-Flash-Next-FP4-Local
@@ -239,6 +239,12 @@ _INTERPRETER_CHECK = textwrap.dedent(
     for name, n, k in SHAPES:
         for m in (1, 4, 16):
             run(name, N_SUB, k, m, None)
+    # M 2 and 8 ride the 4 and 16 buckets with a masked BLOCK_M, so they get
+    # their own launch on the two shapes that exercise it hardest: the widest
+    # N (split-K off, long K) and the narrow one that leans on split-K.
+    for m in (2, 8):
+        run("wide-m", N_SUB, 2560, m, (128, 128, 1, True, 8, 3))
+        run("splitk-m", N_SUB, 640, m, (32, 128, 5, True, 4, 3))
     # Forced tiles: a one-group BLOCK_K, a single split, and the broadcast path
     # at a shape whose tuned plan uses tl.dot.
     run("forced-broadcast", N_SUB, 2560, 1, (16, 32, 8, False, 4, 3))
