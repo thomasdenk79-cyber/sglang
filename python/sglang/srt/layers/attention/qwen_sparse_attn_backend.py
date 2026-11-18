@@ -74,6 +74,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+# Distinct split-K identity-table mirrors kept per backend; keys are powers of
+# two above the CUDA-graph row capacity, so eviction is a safety valve only.
+_NVFP4_SPARSE_TABLE_CACHE = 16
 
 
 def _nvfp4_scratch_dtype_from_mode(mode):
@@ -83,18 +86,35 @@ def _nvfp4_scratch_dtype_from_mode(mode):
         return torch.float8_e4m3fn
     if mode == "bf16":
         return torch.bfloat16
-    raise ValueError(
-        f"SGLANG_QSA_NVFP4_SCRATCH must be 'fp8' or 'bf16', got {mode!r}"
-    )
+    raise ValueError(f"SGLANG_QSA_NVFP4_SCRATCH must be 'fp8' or 'bf16', got {mode!r}")
 
 
-def _nvfp4_sparse_decode_eligible(env_enabled, scratch_is_fp8, is_nvfp4_pool, sm120, no_kv_shard):
+def _nvfp4_sparse_decode_eligible(
+    env_enabled, scratch_is_fp8, is_nvfp4_pool, sm120, no_kv_shard
+):
     """Split-K CUDA decode may serve NVFP4 only with the FP8 scratch: the kernel
     reads that scratch (not the pool), so the pool-dtype guard of the FP8 gate
     does not apply. All other requirements stay."""
     return bool(
         env_enabled and scratch_is_fp8 and is_nvfp4_pool and sm120 and no_kv_shard
     )
+
+
+def _nvfp4_sparse_decode_gate_reason(
+    env_enabled, scratch_is_fp8, is_nvfp4_pool, sm120, no_kv_shard
+):
+    """First unmet split-K requirement, or None when the gate is open."""
+    if not env_enabled:
+        return "SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA is off"
+    if not scratch_is_fp8:
+        return "SGLANG_QSA_NVFP4_SCRATCH is bf16"
+    if not is_nvfp4_pool:
+        return "the QSA KV pool is not NVFP4"
+    if not sm120:
+        return "the split-K kernel is SM120-only"
+    if not no_kv_shard:
+        return "logical KV sharding keeps rows off this rank"
+    return None
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
@@ -351,13 +371,29 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         # Relaxed split-K gate for NVFP4: the pool guard above rejects NVFP4
         # pools, so the FP8 scratch path re-gates on its own eligibility here.
-        self._nvfp4_sparse_decode_cuda = _nvfp4_sparse_decode_eligible(
-            envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get(),
+        # Pool presence is frozen False-safe: the routing check already demands
+        # a live NVFP4 view, and a quant method may attach after construction.
+        nvfp4_env = envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
+        nvfp4_pool = _qsa_nvfp4_quant_method(self.token_to_kv_pool) is not None
+        self._nvfp4_split_k_gate_inputs = (
+            bool(nvfp4_env),
             self._nvfp4_scratch_dtype == torch.float8_e4m3fn,
-            _qsa_nvfp4_quant_method(self.token_to_kv_pool) is not None,
+            nvfp4_pool,
             is_sm120(),
             self._kv_shard_pool is None,
         )
+        self._nvfp4_sparse_decode_cuda = _nvfp4_sparse_decode_eligible(
+            nvfp4_env,
+            self._nvfp4_scratch_dtype == torch.float8_e4m3fn,
+            True,
+            is_sm120(),
+            self._kv_shard_pool is None,
+        )
+        self._nvfp4_split_k_requested = bool(nvfp4_env and nvfp4_pool)
+        self._nvfp4_kv_plan_logged = False
+        self._nvfp4_split_k_skip_notes: set = set()
+        if nvfp4_pool:
+            self._log_nvfp4_kv_plan()
         self._nvfp4_sparse_tables: Dict[Tuple[int, int], Tuple[torch.Tensor, ...]] = {}
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
@@ -2029,26 +2065,57 @@ class QwenSparseAttnBackend(AttentionBackend):
             nvfp4_fp8_descale(v_g),
         )
 
+    def _log_nvfp4_kv_plan(self) -> None:
+        """One line per NVFP4 backend: the gather scratch dtype and whether the
+        split-K decode gate opened, so a log tells which decode path a run took.
+        A requested-but-closed gate warns; the pool check is live at call time.
+        """
+        env_on, fp8_scratch, _, sm120, no_kv_shard = self._nvfp4_split_k_gate_inputs
+        reason = _nvfp4_sparse_decode_gate_reason(
+            env_on, fp8_scratch, True, sm120, no_kv_shard
+        )
+        mode = "fp8" if fp8_scratch else "bf16"
+        state = "on" if reason is None else f"off ({reason})"
+        if self._nvfp4_split_k_requested and reason is not None:
+            logger.warning("QSA NVFP4 KV: scratch=%s split_k=%s", mode, state)
+        else:
+            logger.info("QSA NVFP4 KV: scratch=%s split_k=%s", mode, state)
+        self._nvfp4_kv_plan_logged = True
+
+    def _note_nvfp4_split_k_skip(self, reason: str) -> None:
+        # Once per distinct reason: a permanently-skipped route must not stay
+        # invisible, a per-forward repeat must not spam.
+        if reason not in self._nvfp4_split_k_skip_notes:
+            self._nvfp4_split_k_skip_notes.add(reason)
+            logger.info("QSA NVFP4 split-K skipped: %s", reason)
+
     def _nvfp4_sparse_decode_tables(self, rows, stride, device):
         # Synthetic pool for the split-K kernel over the page-strided scratch:
-        # row r, column c -> slot r * stride + c (identity slot table).
-        key = (rows, stride)
+        # row r, column c -> slot r * stride + c (identity slot table). A table
+        # row depends only on (r, c), so rows round up to a shared capacity
+        # mirror and the cache stays bounded against eager row-count drift.
+        cap_rows = max(self._cuda_graph_max_tokens, 1)
+        while cap_rows < rows:
+            cap_rows *= 2
+        key = (cap_rows, stride)
         cached = self._nvfp4_sparse_tables.get(key)
         if cached is None:
+            while len(self._nvfp4_sparse_tables) >= _NVFP4_SPARSE_TABLE_CACHE:
+                self._nvfp4_sparse_tables.pop(next(iter(self._nvfp4_sparse_tables)))
             slots = (
-                torch.arange(rows, dtype=torch.int32, device=device)[:, None]
+                torch.arange(cap_rows, dtype=torch.int32, device=device)[:, None]
                 * stride
                 + torch.arange(stride, dtype=torch.int32, device=device)[None, :]
             ).contiguous()
             columns = (
                 torch.arange(stride, dtype=torch.int32, device=device)
-                .expand(rows, stride)
+                .expand(cap_rows, stride)
                 .contiguous()
             )
             cached = (
                 slots,
                 columns,
-                torch.arange(rows, dtype=torch.int32, device=device),
+                torch.arange(cap_rows, dtype=torch.int32, device=device),
             )
             self._nvfp4_sparse_tables[key] = cached
         return cached
@@ -2072,12 +2139,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         kv_head_dim = k_buffer.shape[2] * 2
         q_heads = q.shape[1]
         if kv_head_dim != 256 or kv_heads <= 0 or q_heads % kv_heads:
+            self._note_nvfp4_split_k_skip(
+                f"head geometry {q_heads}x{kv_heads}x{kv_head_dim}"
+            )
             return None
         if q_heads // kv_heads > 16:
+            self._note_nvfp4_split_k_skip("q_heads / kv_heads exceeds 16")
             return None
         rows = topk_indices.shape[0]
         batch = forward_batch.batch_size
-        if rows == 0 or batch == 0 or rows != batch:
+        if rows == 0 or batch == 0:
+            return None
+        if rows != batch:
+            # MTP target-verify rows (> batch) stay on the trtllm pack path.
+            self._note_nvfp4_split_k_skip(f"rows {rows} != batch {batch} (verify)")
             return None
         page = _TRTLLM_SPARSE_PAGE_SIZE
         topk = topk_indices.shape[1]
@@ -2089,13 +2164,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         if k_d is None:
             return None  # bf16 scratch: the trtllm pack path owns this case
         sequence_lens = metadata.sequence_lengths
-        if metadata.is_cuda_graph and metadata.fa2_valid_counts is not None:
+        if metadata.is_cuda_graph:
+            if metadata.fa2_valid_counts is None:
+                return None  # incomplete graph metadata; trtllm owns the error
             valid_counts = metadata.fa2_valid_counts[:rows]
         else:
             valid_counts = torch.empty(rows, dtype=torch.int32, device=device)
-            qwen_sparse_valid_counts_triton(
-                sequence_lens, topk_indices, valid_counts, rows, topk
-            )
+        # The fill must run in graph mode too: on replay it is the only producer
+        # of the per-row counts this kernel reads (mirrors _forward_trtllm_sparse).
+        qwen_sparse_valid_counts_triton(
+            sequence_lens, topk_indices, valid_counts, rows, topk
+        )
         cu_strided, _ = self._get_trtllm_sparse_tables(
             rows, pages_per_row, page, device
         )
@@ -2124,7 +2203,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             zero_fill_cols=stride,
         )
         slots_table, columns_table, row_index = self._nvfp4_sparse_decode_tables(
-            capacity_rows, stride, device
+            rows, stride, device
         )
         output = qsa_sparse_decode(
             q=(q * k_d).contiguous(),
@@ -2174,10 +2253,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8 pool stays FP8 here;
-        # validated on SM10x only, SM120 keeps the BF16 scratch. NVFP4 rows go to
-        # the FP8 scratch dtype (SGLANG_QSA_NVFP4_SCRATCH) with the descale folded
-        # through q / the output, the way an FP8 pool folds k_scale/v_scale.
+        # TRTLLM-gen takes BF16 q with FP8-E4M3 KV: an FP8 pool keeps its FP8 KV
+        # only where validated (SM10x), SM120 re-gathers it to BF16. NVFP4 rows
+        # follow SGLANG_QSA_NVFP4_SCRATCH with the descale folded through q /
+        # the output, the way an FP8 pool folds k_scale/v_scale.
         packed_dtype = (
             k_buffer.dtype
             if k_buffer.dtype == torch.float8_e4m3fn and is_sm100_supported()
@@ -2354,6 +2433,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             nvfp4_scales = nvfp4[2:]
             # Logical (dequantized) geometry of the packed-FP4 rows.
             kv_heads, kv_head_dim = k_buffer.shape[1], k_buffer.shape[2] * 2
+            if not self._nvfp4_kv_plan_logged:
+                # A quant method may attach after construction: log the scratch
+                # dtype and split-K gate once the pool is known live.
+                self._log_nvfp4_kv_plan()
         else:
             k_buffer = pool.layer_router.read(layer.layer_id).key()
             v_buffer = pool.layer_router.read(layer.layer_id).value()
@@ -2415,6 +2498,39 @@ class QwenSparseAttnBackend(AttentionBackend):
                 nvfp4=nvfp4_scales,
             )
 
+        return self._forward_fa2_fallback(
+            q,
+            layer,
+            forward_batch,
+            metadata,
+            topk_indices,
+            k_buffer,
+            v_buffer,
+            kv_heads,
+            kv_head_dim,
+            nvfp4_scales,
+        )
+
+    def _forward_fa2_fallback(
+        self,
+        q,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices,
+        k_buffer,
+        v_buffer,
+        kv_heads,
+        kv_head_dim,
+        nvfp4_scales,
+    ) -> torch.Tensor:
+        """Varlen decode fallback for configs without trtllm-gen decode.
+
+        The NVFP4 pack stays on the lossless BF16 scratch regardless of
+        SGLANG_QSA_NVFP4_SCRATCH: the fallback kernels (the SM121 QSA capture
+        and upstream flash_attn varlen) require q/k/v in one and the same
+        dtype and reject an FP8 scratch; this consumer never descales.
+        """
         batch, topk = topk_indices.shape
         sequence_lens = metadata.sequence_lengths
         if metadata.is_cuda_graph:
@@ -2440,14 +2556,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             if metadata.is_cuda_graph
             else batch * topk
         )
-        k_d = v_d = None
-        if nvfp4_scales is not None:
-            nvfp4_scales, k_d, v_d = self._nvfp4_fp8_gather_scales(nvfp4_scales)
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
             kv_heads,
             kv_head_dim,
-            torch.float8_e4m3fn if k_d is not None else q.dtype,
+            q.dtype,
             k_buffer.device,
         )
         row_requests = (
@@ -2484,10 +2597,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 batch,
                 topk,
             )
-        if k_d is not None:
-            # Fold the K descale into q for every packed-KV consumer below; each
-            # branch folds the V descale into its output.
-            q = (q * k_d).contiguous()
         if is_hip():
             relative_indices = torch.arange(
                 topk, dtype=torch.int32, device=q.device
@@ -2505,8 +2614,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 valid_counts,
                 layer.scaling,
             )
-            if v_d is not None:
-                output = output * v_d
             return output.reshape(q.shape[0], -1)
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
@@ -2521,8 +2628,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             causal=True,
         )
-        if v_d is not None:
-            output = output * v_d
         return output.reshape(q.shape[0], -1)
 
 
