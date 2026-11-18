@@ -1472,6 +1472,13 @@ class Envs:
     # Route the BF16 skinny linears (MoE router gate, MTP fc) at M <= 16 to the
     # split-K Triton GEMV tuned for sm_120 instead of cuBLAS.
     SGLANG_SM120_BF16_SKINNY_GEMV = EnvBool(False)
+    # Route the dense MXFP8 linears (e4m3 + one UE8M0 per 32 K) of an MXFP8
+    # checkpoint at M <= SGLANG_MXFP8_SKINNY_GEMV_MAX_M to the split-K Triton
+    # weight-only (W8A16) GEMV tuned for sm_120, instead of the W8A8 GEMM with
+    # its activation quantization. sm_120 CUDA only; any layer the GEMV cannot
+    # serve (bias, other layouts, wider batches) keeps the W8A8 path.
+    SGLANG_MXFP8_SKINNY_GEMV = EnvBool(False)
+    SGLANG_MXFP8_SKINNY_GEMV_MAX_M = EnvInt(16)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS
