@@ -131,6 +131,8 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    # Accepted tokens held by the dynamic draft vocab (-1 = not measured).
+    spec_draft_vocab_coverage: float = -1.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     # Adaptive speculative decoding (currently active tier).
@@ -554,6 +556,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_draft_vocab_coverage = Gauge(
+            name="sglang:spec_draft_vocab_coverage",
+            documentation="Fraction of accepted tokens in the dynamic draft vocabulary since the last decode log (-1 when SGLANG_SPEC_DYNAMIC_VOCAB_METRICS is off).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1745,6 +1753,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.spec_draft_vocab_coverage, stats.spec_draft_vocab_coverage)
         self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
         self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
