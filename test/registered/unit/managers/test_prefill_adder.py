@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_policy import (
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     ChainPrefillBudget,
@@ -2224,6 +2226,67 @@ class TestPrefillAdder(CustomTestCase):
                         self.mock_tree_cache.buffer_pipeline.defer_staged_admission.assert_called_once_with(
                             req, "mamba"
                         )
+
+    def test_static_mamba_prefill_admission_evicts_then_queues_on_shortfall(self):
+        def build_adder(*, evictable_slots):
+            self.mock_token_allocator = self.create_token_allocator(
+                available_size=100_000
+            )
+            self.mock_tree_cache = self.create_tree_cache(full_evictable_size=0)
+            self.mock_tree_cache.supports_mamba.return_value = True
+            self.mock_tree_cache.request_mamba_only = False
+
+            state = StateStorage.empty("mamba")
+            state.slots = MambaSlotAllocator(48, "cpu")
+            live = state.slots.alloc(43 - evictable_slots)
+            cached = state.slots.alloc(evictable_slots)
+            self.assertEqual(state.slots.available_size(), 5)
+            self.mock_token_allocator.state = state
+
+            req_pool = SimpleNamespace(
+                enable_mamba_extra_buffer=True,
+                mamba_initial_tracking_slots=1,
+                holds_state_slots=True,
+                binds_row_units=False,
+            )
+            self.mock_tree_cache.req_to_token_pool = req_pool
+            remaining_cached = evictable_slots
+
+            def evict(demand):
+                nonlocal cached, remaining_cached
+                count = min(demand.state_slots, remaining_cached)
+                if count:
+                    state.slots.free(cached[:count])
+                    cached = cached[count:]
+                    remaining_cached -= count
+
+            self.mock_tree_cache.evict_for_alloc.side_effect = evict
+            adder = self.create_adder(self.create_running_batch())
+            reqs = []
+            for i in range(4):
+                req = self.create_mock_req(i, 0, 0)
+                req.full_untruncated_fill_ids = list(range(8))
+                reqs.append(req)
+            return adder, reqs, state, live
+
+        adder, reqs, state, _ = build_adder(evictable_slots=0)
+        for req in reqs:
+            result = adder.add_one_req(req, False, None)
+            if result is AddReqResult.NO_TOKEN:
+                break
+        self.assertEqual(adder.can_run_list, reqs[:2])
+        self.assertEqual(state.slots.available_size(), 5)
+        self.mock_tree_cache.evict_for_alloc.assert_called_once()
+        self.assertEqual(
+            self.mock_tree_cache.evict_for_alloc.call_args.args[0].state_slots, 6
+        )
+
+        adder, reqs, state, _ = build_adder(evictable_slots=3)
+        for req in reqs:
+            adder.add_one_req(req, False, None)
+        self.assertEqual(adder.can_run_list, reqs)
+        self.assertEqual(state.slots.available_size(), 8)
+        self.assertEqual(self.mock_tree_cache.evict_for_alloc.call_count, 1)
 
     def test_idle_budget_failure_defers_staged_prefix_unless_kv_awaits_transfer(self):
         for kv_awaiting_transfer in (False, True):
