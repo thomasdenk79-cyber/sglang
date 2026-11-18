@@ -251,6 +251,7 @@ def test_hook_uses_the_skinny_gemv_for_a_bias_free_gate(monkeypatch):
 
 
 def test_hook_uses_the_fp32_kernel_for_a_biased_gate(monkeypatch):
+    import sglang.kernels.ops.gemm.sm120_bf16_skinny_gemv as skinny
     import sglang.srt.layers.moe.router_gemv as rgmod
 
     seen = {}
@@ -260,6 +261,7 @@ def test_hook_uses_the_fp32_kernel_for_a_biased_gate(monkeypatch):
         seen["args"] = (x_, w_, b_)
         return out
 
+    monkeypatch.setattr(skinny, "is_sm120", lambda: True)
     monkeypatch.setattr(rgmod, "router_gemv", fake)
     # The verdict asks for CUDA tensors, which a CPU test cannot supply; the
     # layout half of it is covered by test_shape_ok_* above.
@@ -271,6 +273,26 @@ def test_hook_uses_the_fp32_kernel_for_a_biased_gate(monkeypatch):
     assert _call(stub, x, fn) is out
     assert seen["args"] == (x, w, bias)
     assert gate.calls == []
+
+
+def test_hook_falls_through_on_other_arches(monkeypatch):
+    # Both routes are sm_120-only: with is_sm120() False the biased gate must
+    # reach the ReplicatedLinear, even when the layout verdict is True.
+    import sglang.kernels.ops.gemm.sm120_bf16_skinny_gemv as skinny
+    import sglang.srt.layers.moe.router_gemv as rgmod
+
+    monkeypatch.setattr(skinny, "is_sm120", lambda: False)
+    monkeypatch.setattr(rgmod, "router_gemv_applies", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        rgmod, "router_gemv", lambda *a, **kw: pytest.fail("launched off sm_120")
+    )
+    x, w = _operands()
+    bias = torch.zeros(N, dtype=torch.bfloat16)
+    gate = _Gate(w, bias=bias, ret=(torch.zeros(4, N), None))
+    stub, fn = _stub(True, gate)
+    sentry = gate.ret
+    assert _call(stub, x, fn) is sentry[0]
+    assert gate.calls == [x], "an unsupported arch must call the ReplicatedLinear"
 
 
 def test_launch_path_syncs_no_host():

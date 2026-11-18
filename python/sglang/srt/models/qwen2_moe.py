@@ -777,12 +777,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if logits is not None:
                         return logits
             else:
+                from sglang.kernels.ops.gemm.sm120_bf16_skinny_gemv import (
+                    is_sm120,
+                )
                 from sglang.srt.layers.moe.router_gemv import (
                     router_gemv,
                     router_gemv_applies,
                 )
 
-                if router_gemv_applies(hidden_states, weight, bias):
+                # Same sm_120 bound as the bias-free route: the biased kernel
+                # is the untuned donor one and must not launch elsewhere.
+                if is_sm120() and router_gemv_applies(hidden_states, weight, bias):
                     return router_gemv(hidden_states, weight, bias)
         router_logits, _ = self.gate(hidden_states)
         return router_logits
