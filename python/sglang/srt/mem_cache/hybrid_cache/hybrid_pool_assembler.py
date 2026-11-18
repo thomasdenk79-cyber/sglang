@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
-from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost, QSAKVScalePoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
@@ -144,6 +144,13 @@ def _mha_host_inputs(pool, info, drafts=()):
     )
 
 
+# Token-linear NVFP4 KV scales mirrored as KV-indexed page-row sidecars.
+_KV_SCALE_POOL_NAMES = frozenset({PoolName.KV_K_SCALE, PoolName.KV_V_SCALE})
+_KV_SCALE_HOST_LAYOUTS = ("layer_first", "page_first", "page_first_direct")
+# Packed E2M1 KV pages plus E4M3 scales per 16 elements, global scale 1.0.
+QSA_NVFP4_STORAGE_FORMAT_TAG = "qsa-nvfp4-e4m3b16-v1"
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -151,8 +158,18 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    with_sidecars: bool = False,
 ):
-    host_input = kv_pool.get_device_pool_infos()[0].buffer_info
+    infos = kv_pool.get_device_pool_infos()
+    has_kv_scales = any(info.pool_name in _KV_SCALE_POOL_NAMES for info in infos)
+    if has_kv_scales and not with_sidecars:
+        # The KV info alone describes packed NVFP4 rows; without the scale
+        # sidecars a host copy would silently drop the block scales.
+        raise ValueError(
+            f"{pool_label}: NVFP4 KV block scales need the hybrid HiCache host "
+            "pool group; this host path only moves the KV payload."
+        )
+    host_input = infos[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
         kv_host_pool_cls, mha_kwargs = MLATokenToKVPoolHost, {}
@@ -216,6 +233,10 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+    if has_kv_scales:
+        # Packed FP4 pages are only meaningful with their scale sidecars; keep
+        # them apart from any other uint8-backed page format in storage.
+        host_pool.storage_format_tag = QSA_NVFP4_STORAGE_FORMAT_TAG
     if isinstance(kv_pool, PageInterleaveKVPoolMixin):
         return PageInterleaveHostPool(host_pool, kv_pool.placement)
     return host_pool
@@ -1246,13 +1267,14 @@ def build_hybrid_mamba_stack(
         )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
-        kv_bytes = sum(kv_pool.get_kv_size_bytes())
+        kv_bytes = _kv_budget_payload_bytes(kv_pool)
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         host_size=kv_host_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
+        with_sidecars=True,
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         _mamba_entry(
@@ -1608,6 +1630,7 @@ def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
         kv_pool=config.root,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
+        with_sidecars=True,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -1617,6 +1640,8 @@ def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
 def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
+    if config.pool_name in _KV_SCALE_POOL_NAMES:
+        return _build_kv_scale_host_pool(config=config, root_host_pool=root_host_pool)
     if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
         return _build_qsa_indexer_host_pool(
             config=config, root_host_pool=root_host_pool
@@ -1674,6 +1699,45 @@ def _build_qsa_indexer_host_pool(
         pin_memory=root_host_pool.pin_memory,
         allocator_type=_get_allocator_type(),
     )
+
+
+def _build_kv_scale_host_pool(
+    *, config: HostPoolConfig, root_host_pool: Any
+) -> QSAKVScalePoolHost:
+    info = config.buffer_info
+    if (
+        info.key_layout is not IndexKeyLayout.KEY_ROWS
+        or info.compress_ratio != 1
+        or info.page_size != root_host_pool.page_size
+        or any(host != device for device, host in config.device_to_host_layer.items())
+    ):
+        raise ValueError(
+            f"{config.pool_name}: NVFP4 KV scale host requires token-linear key "
+            f"rows on {root_host_pool.page_size}-token pages with every device "
+            f"layer, got key_layout={info.key_layout}, "
+            f"compress_ratio={info.compress_ratio}, page_size={info.page_size}, "
+            f"device_to_host_layer={config.device_to_host_layer}"
+        )
+    if root_host_pool.layout not in _KV_SCALE_HOST_LAYOUTS:
+        raise ValueError(
+            f"{config.pool_name}: NVFP4 KV scales support HiCache layouts "
+            f"{_KV_SCALE_HOST_LAYOUTS}, got {root_host_pool.layout!r}"
+        )
+    return QSAKVScalePoolHost(
+        info,
+        num_host_pages=root_host_pool.page_num,
+        layout=root_host_pool.layout,
+        device=root_host_pool.device,
+        pin_memory=root_host_pool.pin_memory,
+        allocator_type=_get_allocator_type(),
+        pool_name=str(config.pool_name),
+    )
+
+
+def _kv_budget_payload_bytes(kv_pool: Any) -> int:
+    # Token-linear NVFP4 scales are host sidecars, budgeted with the index bytes.
+    scale_bytes = getattr(kv_pool, "get_kv_scale_size_bytes", lambda: 0)()
+    return int(sum(kv_pool.get_kv_size_bytes())) - scale_bytes
 
 
 def _kv_budget_index_bytes(config: HostPoolGroupConfig) -> int:
@@ -1854,6 +1918,14 @@ def build_full_draft_pools(
         )
     ]
 
+    if len(config.sidecars) > 1 or any(
+        sidecar.pool_name in _KV_SCALE_POOL_NAMES for sidecar in config.sidecars
+    ):
+        # Every draft sidecar is stored as DRAFT_INDEXER.
+        raise NotImplementedError(
+            "HiCache draft sidecars support one index pool and no NVFP4 KV "
+            f"scales, got {[str(sidecar.pool_name) for sidecar in config.sidecars]}"
+        )
     for sidecar in config.sidecars:
         indexer_host_pool = _build_sidecar_host_pool(
             config=sidecar, root=pool, root_host_pool=draft_host_pool
