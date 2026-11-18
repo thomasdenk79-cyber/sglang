@@ -331,6 +331,9 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Startup: decode CSF-compressed NVFP4 weight scales with numpy instead of
+    # torch ops (byte-identical, ~3x less dispatch overhead per stream pair).
+    SGLANG_STARTUP_CSF_FAST_DECODE = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
