@@ -960,6 +960,9 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     # Threads that read the page files of one batch in parallel (1 = serial reads).
     SGLANG_HICACHE_FILE_BACKEND_READ_WORKERS = EnvInt(1)
+    # Read page files with O_DIRECT (aligned buffers only; else buffered).
+    # Buffered reads are served by the page cache when the files are warm.
+    SGLANG_HICACHE_FILE_BACKEND_DIRECT_IO = EnvBool(False)
     # Buffer mode: staged prefetches pin their device anchor from IO commit
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.

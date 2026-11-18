@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import random
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+# O_DIRECT needs the buffer address, length and file offset on this alignment.
+_DIRECT_IO_ALIGN = 4096
 
 
 @dataclass
@@ -898,6 +901,9 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.read_workers = max(1, envs.SGLANG_HICACHE_FILE_BACKEND_READ_WORKERS.get())
+        self.direct_io = envs.SGLANG_HICACHE_FILE_BACKEND_DIRECT_IO.get() and hasattr(
+            os, "O_DIRECT"
+        )
         self._read_pool = None
         self._read_pool_lock = threading.Lock()
         self.file_path = (
@@ -1058,12 +1064,18 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
-            with open(tensor_path, "rb", buffering=0) as f:
-                if os.fstat(f.fileno()).st_size != expected:
-                    raise IOError(f"Incorrect object size for {suffixed}")
-                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+            buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+            if not (
+                self.direct_io
+                and expected % _DIRECT_IO_ALIGN == 0
+                and target_location.data_ptr() % _DIRECT_IO_ALIGN == 0
+                and self._read_direct(tensor_path, buf, expected, suffixed)
+            ):
+                with open(tensor_path, "rb", buffering=0) as f:
+                    if os.fstat(f.fileno()).st_size != expected:
+                        raise IOError(f"Incorrect object size for {suffixed}")
+                    if f.readinto(buf) != expected:
+                        raise IOError(f"Short read for {suffixed}")
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
@@ -1073,6 +1085,34 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove(suffixed)
             logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
             return None
+
+    @staticmethod
+    def _read_direct(path: str, buf: memoryview, expected: int, suffixed: str) -> bool:
+        """O_DIRECT read into an aligned buffer, bypassing the page cache.
+        False if the filesystem refuses O_DIRECT (the caller reads buffered)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except OSError as e:
+            if e.errno == errno.EINVAL:
+                return False
+            raise
+        try:
+            if os.fstat(fd).st_size != expected:
+                raise IOError(f"Incorrect object size for {suffixed}")
+            done = 0
+            while done < expected:
+                try:
+                    n = os.preadv(fd, [buf[done:]], done)
+                except OSError as e:
+                    if e.errno == errno.EINVAL and done == 0:
+                        return False
+                    raise
+                if n <= 0:
+                    raise IOError(f"Short read for {suffixed}")
+                done += n
+            return True
+        finally:
+            os.close(fd)
 
     def batch_get(
         self,
