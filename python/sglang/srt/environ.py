@@ -960,6 +960,25 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     # Threads that read the page files of one batch in parallel (1 = serial reads).
     SGLANG_HICACHE_FILE_BACKEND_READ_WORKERS = EnvInt(1)
+    # Read page files with O_DIRECT (aligned buffers only; else buffered).
+    # Buffered reads are served by the page cache when the files are warm.
+    SGLANG_HICACHE_FILE_BACKEND_DIRECT_IO = EnvBool(False)
+    # Buffer mode: restore a storage hit larger than the host arena in
+    # chunks streamed through a small pinned ring straight into device rows,
+    # and split oversize backups into staging-sized pieces.
+    SGLANG_HICACHE_BUFFER_STREAM = EnvBool(False)
+    # Tokens per streamed chunk (rounded down to the page size).
+    SGLANG_HICACHE_BUFFER_STREAM_CHUNK_TOKENS = EnvInt(65536)
+    # Chunks in flight (ring slots): 2 = double, 3 = triple buffering.
+    SGLANG_HICACHE_BUFFER_STREAM_INFLIGHT = EnvInt(3)
+    # H2D quota: MB a restore may copy host-to-device per scheduler
+    # iteration (0 = unthrottled). The host link is shared with the
+    # latency-critical transfers of every forward (e.g. pinned PLE gathers),
+    # and stream priority does not arbitrate DMA, so the copy is paced.
+    SGLANG_HICACHE_BUFFER_STREAM_H2D_MB_PER_ITER = EnvInt(32)
+    # Device rows a restore leaves free (after evicting cold nodes) for the
+    # running requests when it reserves its next chunk.
+    SGLANG_HICACHE_BUFFER_STREAM_DEVICE_HEADROOM = EnvInt(32768)
     # Buffer mode: staged prefetches pin their device anchor from IO commit
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.

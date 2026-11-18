@@ -4080,6 +4080,8 @@ class UnifiedRadixCache(BasePrefixCache):
                                 else None
                             ),
                         )
+                    if getattr(operation, "buffer_stream", None) is not None:
+                        self.buffer_pipeline.finish_stream_operation(operation)
 
         def _drain_backup():
             acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
@@ -4736,6 +4738,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # After the drain: a prefetch it retired is not voted on.
             self._vote_prefetch_deadlines()
         if self.buffer_pipeline is not None:
+            self.buffer_pipeline.tick_streams()
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             storage_metrics = self.cache_controller.storage_backend.get_stats()
