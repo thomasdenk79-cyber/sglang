@@ -210,6 +210,10 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvFloatWithAlias(_DeprecatedEnvFallback, EnvFloat):
+    pass
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -1509,7 +1513,11 @@ class Envs:
     # and MAX_ROWS bound the batch sizes it touches. KEEP_IDS zeroes the weight
     # but keeps the id (equivalence control without the GEMM saving). RENORM
     # restores a pruned row's routed weight sum.
-    SGLANG_MOE_PRUNE_SINGLETON_TAU = EnvFloat(0.0)
+    # SGLANG_MOE_PRUNE_SINGLETON_TAU (HyperBurst's spelling) is the accepted
+    # deprecated alias of this knob.
+    SGLANG_MOE_SINGLETON_PRUNE_TAU = EnvFloatWithAlias(
+        0.0, deprecated_name="SGLANG_MOE_PRUNE_SINGLETON_TAU"
+    )
     SGLANG_MOE_PRUNE_MIN_RANK = EnvInt(1)
     SGLANG_MOE_PRUNE_MIN_ROWS = EnvInt(2)
     SGLANG_MOE_PRUNE_MAX_ROWS = EnvInt(64)
@@ -1609,6 +1617,10 @@ class Envs:
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
     SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+    # Programmatic dependent launch for the fork's Triton kernels that do not
+    # carry PDL already; see python/sglang/kernels/triton_pdl.py. No-op off
+    # sm_90+ and when unset, where the PTX and launch configs stay unmodified.
+    SGLANG_TRITON_PDL = EnvBool(False)
 
     # ===================================================================
     # Expert parallel load balancing
