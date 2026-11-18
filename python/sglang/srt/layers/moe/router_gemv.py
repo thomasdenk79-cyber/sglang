@@ -33,7 +33,9 @@ capture bakes into the graph pool. No host sync, no ``.item()``.
 **Flag**: ``SGLANG_ROUTER_GEMV=1`` (default 0), resolved once per MoE block in
 ``Qwen2MoeSparseMoeBlock.__init__`` and only for the Qwen MoE model families
 on CUDA; every guard in :func:`_forward_router_logits` that fails sends the
-call to the ``ReplicatedLinear`` unchanged.
+call to the ``ReplicatedLinear`` unchanged. The layout gate demands
+``K % BLOCK_K == 0``: the k-loop steps BLOCK_K columns with unmasked loads,
+so an odd multiple of 128 would read past every weight row.
 
 **Gain**: the donor's record (docs/optimizations.md B3) has the cuBLAS pair --
 GEMM plus splitKreduce -- at 119 us per decode step over 61 calls, and the
@@ -123,7 +125,7 @@ def router_gemv_shape_ok(
     return bool(
         1 <= m <= MAX_M
         and k == weight_k
-        and k % 128 == 0
+        and k % BLOCK_K == 0
         and n % BLOCK_N == 0
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
@@ -177,8 +179,10 @@ def router_gemv(
     n, weight_k = weight.shape
     if not 1 <= m <= MAX_M:
         raise ValueError("router GEMV requires 1 <= M <= 16")
-    if k != weight_k or k % 128 != 0 or n % BLOCK_N != 0:
-        raise ValueError("router GEMV requires matching K % 128 == 0 and N % 32 == 0")
+    if k != weight_k or k % BLOCK_K != 0 or n % BLOCK_N != 0:
+        raise ValueError(
+            f"router GEMV requires matching K % {BLOCK_K} == 0 and N % 32 == 0"
+        )
     tensors = (x, weight) if bias is None else (x, weight, bias)
     if any(not tensor.is_cuda for tensor in tensors):
         raise ValueError("router GEMV requires CUDA tensors")

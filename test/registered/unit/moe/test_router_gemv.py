@@ -131,11 +131,17 @@ def test_shape_ok_rejects_everything_the_kernel_cannot_take():
         x, torch.zeros(N, K + 32, dtype=torch.bfloat16)[:, :K]
     )  # non-contiguous w
     assert not rg.router_gemv_shape_ok(x, torch.zeros(N - 16, K, dtype=torch.bfloat16))
-    # K must be a multiple of the 128 the donor requires.
+    # K must be a multiple of BLOCK_K: the k-loop steps BLOCK_K columns with
+    # unmasked loads, so an odd multiple of 128 would read past every row.
     assert not rg.router_gemv_shape_ok(
         torch.zeros(4, 2500, dtype=torch.bfloat16),
         torch.zeros(N, 2500, dtype=torch.bfloat16),
     )
+    for k in (128, 384, 640, 896):
+        assert not rg.router_gemv_shape_ok(
+            torch.zeros(4, k, dtype=torch.bfloat16),
+            torch.zeros(N, k, dtype=torch.bfloat16),
+        ), k
     assert not rg.router_gemv_shape_ok(x, w, torch.zeros(N, 1, dtype=torch.bfloat16))
     assert not rg.router_gemv_shape_ok(x, w, torch.zeros(N, dtype=torch.float32))
 
@@ -158,6 +164,13 @@ def test_entry_point_validates():
         rg.router_gemv(x, w, torch.zeros(N, dtype=torch.float32))
     with pytest.raises(ValueError):
         rg.router_gemv(x, w, torch.zeros(N, K, dtype=torch.bfloat16))
+    # K = 384 is an odd multiple of 128: the unmasked BLOCK_K loads would run
+    # past every weight row, so the entry point must reject it, not launch.
+    with pytest.raises(ValueError):
+        rg.router_gemv(
+            torch.zeros(4, 384, dtype=torch.bfloat16),
+            torch.zeros(N, 384, dtype=torch.bfloat16),
+        )
 
 
 class _Gate:
