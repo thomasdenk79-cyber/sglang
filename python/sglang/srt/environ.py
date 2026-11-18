@@ -1484,6 +1484,10 @@ class Envs:
     # Route the BF16 skinny linears (MoE router gate, MTP fc) at M <= 16 to the
     # split-K Triton GEMV tuned for sm_120 instead of cuBLAS.
     SGLANG_SM120_BF16_SKINNY_GEMV = EnvBool(False)
+    # Opt-in: the draft model's one-token MoE call runs the route-parallel W4A16
+    # NVFP4 GEMV (layers/moe/draft_moe_gemv.py) instead of FlashInfer CUTLASS.
+    # Draft numerics only; sm_120, EP/TP 1, gated silu layers without limits.
+    SGLANG_OPT_DRAFT_MOE_GEMV = EnvBool(False)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS
