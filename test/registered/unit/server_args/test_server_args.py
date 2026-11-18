@@ -1654,15 +1654,51 @@ class TestKV4Compatibility(unittest.TestCase):
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_qsa_nvfp4_fails_closed_for_scale_dropping_paths(self):
         self._patch_qsa_model()
+        hicache = {"enable_hierarchical_cache": True}
         for overrides, flag in (
-            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
             ({"enable_lmcache": True}, "enable-lmcache"),
             ({"disaggregation_mode": "decode"}, "disaggregation-mode"),
+            (
+                {"enable_unified_cache_external_linker": True},
+                "enable-unified-cache-external-linker",
+            ),
+            ({**hicache, "hicache_storage_backend": "nixl"}, "storage-backend=nixl"),
+            (
+                {**hicache, "hicache_storage_backend": "mooncake"},
+                "storage-backend=mooncake",
+            ),
+            ({**hicache, "hicache_mem_layout": "page_head"}, "mem-layout=page_head"),
+            (
+                {**hicache, "hicache_io_backend": "kernel_ascend"},
+                "io-backend=kernel_ascend",
+            ),
+            (
+                {
+                    **hicache,
+                    "hicache_storage_backend": "file",
+                    "hicache_storage_key_scheme": "unified",
+                },
+                "key-scheme=unified",
+            ),
         ):
             with self.subTest(flag=flag):
                 args = self._make_unrouted_nvfp4_args(**overrides)
                 with self.assertRaisesRegex(ValueError, flag):
                     handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_qsa_nvfp4_allows_hicache_with_scale_sidecars(self):
+        self._patch_qsa_model()
+        for overrides in (
+            {},
+            {"hicache_mem_layout": "layer_first", "hicache_io_backend": "direct"},
+            {"hicache_storage_backend": "file", "hicache_write_policy": "write_through"},
+        ):
+            with self.subTest(**overrides):
+                args = self._make_unrouted_nvfp4_args(
+                    enable_hierarchical_cache=True, **overrides
+                )
+                handle_kv4_compatibility(args)
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_qsa_rejects_fp4_mx_block16(self):

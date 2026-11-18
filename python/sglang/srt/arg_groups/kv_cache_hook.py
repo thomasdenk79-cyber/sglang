@@ -384,9 +384,40 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+# HiCache moves QSA NVFP4 block scales as page-row sidecars of the KV pool;
+# these are the host layouts, IO backends and L3 backends that path implements.
+QSA_KV4_HICACHE_MEM_LAYOUTS = ("layer_first", "page_first", "page_first_direct")
+QSA_KV4_HICACHE_IO_BACKENDS = ("kernel", "direct")
+QSA_KV4_HICACHE_STORAGE_BACKENDS = (None, "file")
+
+
+def _unsupported_qsa_kv4_hicache_flags(cfg: Any) -> list[str]:
+    checks = (
+        (
+            f"--hicache-mem-layout={cfg.hicache_mem_layout}",
+            cfg.hicache_mem_layout not in QSA_KV4_HICACHE_MEM_LAYOUTS,
+        ),
+        (
+            f"--hicache-io-backend={cfg.hicache_io_backend}",
+            cfg.hicache_io_backend not in QSA_KV4_HICACHE_IO_BACKENDS,
+        ),
+        (
+            f"--hicache-storage-backend={cfg.hicache_storage_backend}",
+            cfg.hicache_storage_backend not in QSA_KV4_HICACHE_STORAGE_BACKENDS,
+        ),
+        (
+            f"--hicache-storage-key-scheme={cfg.hicache_storage_key_scheme}",
+            cfg.hicache_storage_backend is not None
+            and cfg.hicache_storage_key_scheme == "unified",
+        ),
+    )
+    return [flag for flag, enabled in checks if enabled]
+
+
 def _check_qsa_kv4_compatibility(cfg: Any) -> None:
     """FP4 KV on a Qwen QSA pool: NVFP4 only, on the paths that preserve its
-    block scales; every other combination fails closed."""
+    block scales; every other combination fails closed. HiCache carries the
+    scales as KV sidecars with the host pool and the file storage backend."""
     if cfg.kv_cache_dtype != "nvfp4":
         raise ValueError(
             f"--kv-cache-dtype={cfg.kv_cache_dtype} is not supported for Qwen QSA "
@@ -398,10 +429,15 @@ def _check_qsa_kv4_compatibility(cfg: Any) -> None:
             ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
             ("--enable-lmcache", cfg.enable_lmcache),
             ("--attn-cp-size > 1", (cfg.attn_cp_size or 1) > 1),
-            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            (
+                "--enable-unified-cache-external-linker",
+                cfg.enable_unified_cache_external_linker,
+            ),
         )
         if enabled
     ]
+    if cfg.enable_hierarchical_cache:
+        unsupported += _unsupported_qsa_kv4_hicache_flags(cfg)
     if unsupported:
         raise ValueError(
             "NVFP4 KV on Qwen QSA models does not support "
