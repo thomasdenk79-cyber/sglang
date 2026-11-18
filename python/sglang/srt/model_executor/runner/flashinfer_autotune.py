@@ -295,6 +295,26 @@ def _drop_diverged_autotune_cache(
     cache_path.unlink(missing_ok=True)
 
 
+def should_replay_autotune_cache(
+    *,
+    reuse_cache: bool,
+    loaded: object,
+    sync_group: Optional[torch.distributed.ProcessGroup],
+) -> bool:
+    """Skip profiling when a valid tactic cache was loaded (opt-in).
+
+    ``loaded`` is ``load_configs``'s result: ``False`` when the file's metadata
+    does not match this environment. Single-rank only: ranks must agree on
+    whether they profile, and tuning is what keeps their tactics in sync.
+    """
+    return (
+        envs.SGLANG_STARTUP_AUTOTUNE_REPLAY.get()
+        and reuse_cache
+        and loaded is True
+        and sync_group is None
+    )
+
+
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer import autotune_v2
@@ -337,8 +357,19 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
         # the target's tactics when the draft worker loads; load and save them by hand.
         tuner = AutoTuner.get()
+        loaded = False
         if reuse_cache and autotune_cache.is_file():
-            tuner.load_configs(str(autotune_cache))
+            loaded = tuner.load_configs(str(autotune_cache))
+        replay = should_replay_autotune_cache(
+            reuse_cache=reuse_cache, loaded=loaded, sync_group=sync_group
+        )
+        if replay:
+            log_info_on_rank0(
+                logger,
+                "FlashInfer autotune: replaying cached tactics without profiling "
+                "(SGLANG_STARTUP_AUTOTUNE_REPLAY=1); uncovered shapes use the "
+                "default tactic.",
+            )
         mega_context = empty_context()
         if (
             get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
@@ -363,16 +394,21 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         with (
             _autotune_process_group(sync_group),
             autotune(
-                True,
+                not replay,
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
-            autotune_v2(mode="tune", persistent_cache=False),
+            # Replay serves the loaded tactics exactly as serving does, outside v2.
+            (
+                empty_context()
+                if replay
+                else autotune_v2(mode="tune", persistent_cache=False)
+            ),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield
-        if reuse_cache:
+        if reuse_cache and not replay:
             tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")

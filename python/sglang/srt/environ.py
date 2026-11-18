@@ -1518,6 +1518,10 @@ class Envs:
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # Startup: when the tactic cache above loads cleanly, run the autotune
+    # dummy forwards in replay mode (no profiling). Shapes the cache does not
+    # cover fall back to the default tactic until the next tuning run.
+    SGLANG_STARTUP_AUTOTUNE_REPLAY = EnvBool(False)
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
