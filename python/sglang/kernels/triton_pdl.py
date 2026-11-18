@@ -29,6 +29,12 @@ the launch instead of silently keeping the feature off). When it is false the
 Triton's own default, so the generated PTX and the launch config are identical
 to the un-instrumented build.
 
+The one exception is ``ops/elementwise.fused_sigmoid_mul``, which already
+PDL-launched behind the pre-existing ``is_arch_support_pdl()`` gate before this
+flag existed: there ``launch_pdl`` and the kernel's ``gdc_wait`` stay driven by
+that arch check, and ``SGLANG_TRITON_PDL`` gates only the added
+``GDC_TRIGGER`` (``griddepcontrol.launch_dependents``, HyperBurst patch 0069).
+
 ``launch_pdl`` is omitted rather than passed as ``False`` when the flag is off:
 it is declared only by Triton's CUDA backend (``CUDAOptions``), ``HIPOptions``
 has no such field, and ``JITFunction._pack_args`` raises ``KeyError`` for a
@@ -45,6 +51,7 @@ this flag.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -52,7 +59,11 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
+from sglang.kernels.spec import DeviceType, PlatformInfo
+
 __all__ = ["triton_pdl_enabled", "pdl_wait", "pdl_trigger"]
+
+logger = logging.getLogger(__name__)
 
 _FLAG = "SGLANG_TRITON_PDL"
 # Keep in sync with EnvBoolCompat in sglang/srt/environ.py; _flag_set reads
@@ -89,15 +100,55 @@ def _flag_set() -> bool:
 
 
 _PDL_DEVICE_VERDICT: Optional[bool] = None
+_PDL_PROBE_REASON: Optional[str] = None
+_PDL_VERDICT_LOGGED = False
+_PDL_PROBE_WARNED = False
+
+# detect() reports these only for a torch-visible foreign accelerator, which
+# never hosts a CUDA PDL launch: a False from it is a verdict, not missing
+# information. The default "cpu" snapshot is neither: it is what detect()
+# returns while no CUDA device has been selected in this process yet.
+_FOREIGN_ACCELERATORS = frozenset(
+    d.value for d in (DeviceType.HIP, DeviceType.NPU, DeviceType.MLU, DeviceType.MUSA)
+)
 
 
 def _probe_pdl_support() -> Optional[bool]:
-    """Ask the tree's own predicate; ``None`` means the probe itself failed."""
+    """Ask the platform once; ``None`` means "unknown -- retry next launch".
+
+    The tree's ``is_arch_support_pdl`` is ``cache_once``'d and ``current_arch``
+    caches its arch object, so either can latch a pre-device CPU verdict (a
+    parent process probed before its TP/DP workers selected a device) as
+    ``False`` for the life of the process -- that would let a flag-on arm
+    decode all night silently without PDL (review3 B2). Conclusiveness
+    therefore comes from a fresh ``PlatformInfo`` snapshot: with CUDA selected,
+    ask the arch directly (it reads the live device, no cached layer); with a
+    foreign accelerator ``False`` is definitive; with the default CPU snapshot
+    a ``False`` is only missing information, so the probe stays retryable.
+    """
+    global _PDL_PROBE_REASON
     try:
+        p = PlatformInfo.detect(use_cache=False)
+        if p.device_type == DeviceType.CUDA.value:
+            from sglang.kernels.arch._cuda import CudaArch
+
+            answer = CudaArch().supports_pdl
+            _PDL_PROBE_REASON = "cuda capability verdict on the selected device"
+            return answer
         from sglang.kernels.jit.utils import is_arch_support_pdl
 
-        return bool(is_arch_support_pdl())
-    except Exception:
+        answer = bool(is_arch_support_pdl())
+        if not answer and p.device_type not in _FOREIGN_ACCELERATORS:
+            _PDL_PROBE_REASON = (
+                f"platform {p.device_type!r} has no CUDA device selected yet"
+            )
+            return None
+        _PDL_PROBE_REASON = (
+            "foreign-accelerator verdict" if answer is False else "device verdict"
+        )
+        return answer
+    except Exception as exc:
+        _PDL_PROBE_REASON = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -107,30 +158,56 @@ def _device_supports_pdl() -> bool:
     ``current_arch`` initialises CUDA on its first call, so probing eagerly
     would set the CUDA context before device selection/fork in whatever
     process imports the kernels package first. Only a definitive answer is
-    kept: a probe that raised (driver not ready at the very first instrumented
-    launch, a transient CUDA failure) is retried on the next launch instead of
-    sticking as ``False`` for the life of the process, which would otherwise
-    let a flag-on arm run the whole decode silently without PDL.
+    kept: a probe that raised, or one that saw no CUDA device selected yet,
+    is retried on the next launch instead of sticking as ``False`` for the
+    life of the process, which would otherwise let a flag-on arm run the
+    whole decode silently without PDL. The first resolved verdict is logged
+    with its reason so an operator can attribute the arm from the server log.
     """
-    global _PDL_DEVICE_VERDICT
+    global _PDL_DEVICE_VERDICT, _PDL_VERDICT_LOGGED, _PDL_PROBE_WARNED
     if _PDL_DEVICE_VERDICT is None:
         _PDL_DEVICE_VERDICT = _probe_pdl_support()
+    if _PDL_DEVICE_VERDICT is not None:
+        if not _PDL_VERDICT_LOGGED:
+            _PDL_VERDICT_LOGGED = True
+            logger.info(
+                "SGLANG_TRITON_PDL first instrumented launch: device gate=%s "
+                "(reason: %s)",
+                _PDL_DEVICE_VERDICT,
+                _PDL_PROBE_REASON,
+            )
+    elif not _PDL_PROBE_WARNED:
+        # Latched while the gate stays undecided; re-armed by the reset below.
+        _PDL_PROBE_WARNED = True
+        logger.warning(
+            "SGLANG_TRITON_PDL=1 but the device gate is undecided (%s); staying "
+            "off and retrying on the next instrumented launch",
+            _PDL_PROBE_REASON,
+        )
     return _PDL_DEVICE_VERDICT is True
 
 
 def _reset_pdl_device_gate() -> None:
-    """Forget the cached verdict; the predicate is swapped between test cases."""
-    global _PDL_DEVICE_VERDICT
+    """Forget the cached verdict and the log latches; the test seams are
+    swapped between cases."""
+    global _PDL_DEVICE_VERDICT, _PDL_PROBE_REASON
+    global _PDL_VERDICT_LOGGED, _PDL_PROBE_WARNED
     _PDL_DEVICE_VERDICT = None
+    _PDL_PROBE_REASON = None
+    _PDL_VERDICT_LOGGED = False
+    _PDL_PROBE_WARNED = False
 
 
 def triton_pdl_enabled() -> bool:
     """``True`` when ``SGLANG_TRITON_PDL`` is set and the device supports griddepcontrol.
 
-    Launch sites call this per launch and pass the result as both
-    ``launch_pdl=`` and ``USE_PDL=``, so the launch attribute and the
-    ``griddepcontrol`` instructions can never disagree, and a value set after
-    import (or an unparsable one) is honoured / reported on the next launch.
+    The three wait+trigger sites pass the result as both ``launch_pdl=`` and
+    ``USE_PDL=``, so the launch attribute and the ``griddepcontrol``
+    instructions can never disagree, and a value set after import (or an
+    unparsable one) is honoured / reported on the next launch.
+    ``ops/elementwise.fused_sigmoid_mul`` predates the flag: only its
+    ``GDC_TRIGGER`` follows this read, ``launch_pdl``/``USE_PDL`` stay
+    ``is_arch_support_pdl()``-driven there.
     """
     return _flag_set() and _device_supports_pdl()
 
