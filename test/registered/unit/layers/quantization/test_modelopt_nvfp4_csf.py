@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.layers.quantization.nvfp4_csf import (
     decode_csf_scales,
@@ -131,6 +132,33 @@ class TestDecodeCsfScales(CustomTestCase):
         for case, (case_fixed, case_exceptions) in cases.items():
             with self.subTest(case=case), self.assertRaisesRegex(ValueError, "layer"):
                 decode_csf_scales("layer", case_fixed, case_exceptions)
+
+
+class TestFastDecodeCsfScales(CustomTestCase):
+    def test_matches_the_torch_decode(self):
+        for rows, columns, exception_count in ((16, 4, 0), (32, 8, 5), (64, 32, 40)):
+            scale_bytes = _random_scales(rows, columns, exception_count)
+            fixed, exceptions = _encode(scale_bytes)
+            with envs.SGLANG_STARTUP_CSF_FAST_DECODE.override(True):
+                fast = decode_csf_scales("layer", fixed, exceptions)
+            self.assertEqual(fast.dtype, torch.float8_e4m3fn)
+            self.assertTrue(torch.equal(fast.view(torch.uint8), scale_bytes))
+
+    def test_malformed_streams_raise(self):
+        fixed, exceptions = _encode(_random_scales(16, 4, 2))
+        with envs.SGLANG_STARTUP_CSF_FAST_DECODE.override(True):
+            with self.assertRaisesRegex(ValueError, "sorted, unique"):
+                decode_csf_scales(
+                    "layer",
+                    fixed,
+                    exceptions.view(torch.int32).flip(0).view(torch.uint32),
+                )
+            with self.assertRaisesRegex(ValueError, "1-D uint32"):
+                decode_csf_scales("layer", fixed, exceptions.view(torch.int32))
+            bad = fixed.clone()
+            bad[0, 0] = 241
+            with self.assertRaisesRegex(ValueError, "at most"):
+                decode_csf_scales("layer", bad, exceptions)
 
 
 class TestDecodeCsfWeightScales(CustomTestCase):
