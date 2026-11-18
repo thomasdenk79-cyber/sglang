@@ -120,6 +120,7 @@ def test_disabled_config_is_noop():
     ],
 )
 def test_invalid_env_settings_raise(monkeypatch, env):
+    monkeypatch.delenv("SGLANG_MOE_SINGLETON_PRUNE_TAU", raising=False)
     monkeypatch.setenv("SGLANG_MOE_PRUNE_SINGLETON_TAU", "0.1")
     for name, value in env.items():
         monkeypatch.setenv(name, value)

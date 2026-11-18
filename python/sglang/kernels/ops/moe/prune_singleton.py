@@ -5,7 +5,8 @@ The routed-expert grouped GEMM of a small batch is bound by expert weight
 reads, so every *distinct* expert costs a full weight read. A route that is the
 only route to its expert in the current MoE call (a singleton) costs that whole
 read for one row; a route to an expert another row also uses costs nothing
-extra. ``SGLANG_MOE_PRUNE_SINGLETON_TAU`` masks every route that is
+extra. ``SGLANG_MOE_SINGLETON_PRUNE_TAU`` (deprecated alias:
+``SGLANG_MOE_PRUNE_SINGLETON_TAU``) masks every route that is
 
 * the only route to its expert within the call,
 * below ``tau`` in routing weight, and
@@ -21,11 +22,17 @@ outside ``[0, num_expert_slots)`` are neither counted nor pruned. Rows that
 upstream masked as padding (all ids ``-1``) are ignored; unmasked stale rows of
 a padded graph bucket still count. ``RENORM`` rescales the surviving routed
 weights of a pruned row back to that row's routed weight sum before pruning;
-rows without a pruned route are unchanged.
+rows without a pruned route are unchanged. HyperBurst's ``RENORM`` instead
+divides the survivors by their own weight sum; as in HB, the default here is
+off, so a pruned row keeps the surviving weights as-is and loses the dropped
+routing mass.
 
 The work is one single-CTA Triton kernel over the ``[M, k]`` top-k tensors, in
 place, without host sync or allocation, so it is CUDA-graph capturable once
-the histogram scratch exists. It changes the model output (lossy); defaults
+the histogram scratch exists. The launch honours ``SGLANG_TRITON_PDL`` (see
+``sglang.kernels.triton_pdl``); with the flag off the PTX and the launch
+config are identical to the un-instrumented kernel.
+It changes the model output (lossy); defaults
 leave it off.
 """
 
@@ -37,6 +44,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
+
+from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +71,7 @@ def get_prune_config() -> PruneConfig:
     from sglang.srt.environ import envs
 
     cfg = PruneConfig(
-        tau=envs.SGLANG_MOE_PRUNE_SINGLETON_TAU.get(),
+        tau=envs.SGLANG_MOE_SINGLETON_PRUNE_TAU.get(),
         min_rank=envs.SGLANG_MOE_PRUNE_MIN_RANK.get(),
         min_rows=envs.SGLANG_MOE_PRUNE_MIN_ROWS.get(),
         max_rows=envs.SGLANG_MOE_PRUNE_MAX_ROWS.get(),
@@ -183,7 +192,11 @@ def _kernel():
         SENTINEL_: tl.constexpr,
         KEEP_IDS: tl.constexpr,
         PAIRWISE: tl.constexpr,
+        USE_PDL: tl.constexpr = False,
     ):
+        # ids/weights are the preceding routing kernel's output, so every load
+        # below is dependent: the wait only buys the block-scheduling ramp.
+        pdl_wait(USE_PDL)
         r = tl.arange(0, MP)
         c = tl.arange(0, KP)
         off = r[:, None] * K + c[None, :]
@@ -231,6 +244,7 @@ def _kernel():
             tl.where(prune, 0.0, w).to(w_ptr.dtype.element_ty),
             mask=m,
         )
+        pdl_trigger(USE_PDL)
 
     return _prune_singleton_kernel
 
@@ -314,6 +328,8 @@ def maybe_prune_singleton_routes_(
         SENTINEL_=SENTINEL,
         KEEP_IDS=cfg.keep_ids,
         PAIRWISE=cnt is None,
+        USE_PDL=PDL,
+        launch_pdl=PDL,
         num_warps=4,
     )
     if before is not None:
