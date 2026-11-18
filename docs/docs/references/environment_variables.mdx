@@ -1743,7 +1743,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_PDL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable programmatic dependent launch (PDL) for the fork's own Triton kernels that do not carry it already: the MoE singleton-prune kernel, the SM120 skinny GEMV, the GDN QKVZBA unpack and the fused sigmoid-mul. Accepted values: <code>1/true/yes/y/on/enable</code>; any other unparsable value raises at the first instrumented launch instead of silently staying off. No-op off sm_90+.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable programmatic dependent launch (PDL) on the fork's own Triton kernels: wait plus trigger on the MoE singleton-prune kernel, the SM120 skinny GEMV and the GDN QKVZBA unpack; on the fused sigmoid-mul, which has PDL-launched behind an arch check since before this flag, it adds only the dependent trigger. Accepted values: <code>1/true/yes/y/on/enable</code>; any other unparsable value raises at the first instrumented launch instead of silently staying off. No-op off sm_90+.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
