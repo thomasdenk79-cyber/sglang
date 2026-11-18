@@ -345,6 +345,73 @@ def test_runner_workspace_and_plumbing(monkeypatch):
     assert seen["cfg"] is dmg.DEFAULT_CONFIG
 
 
+def test_more_routes_than_the_scratch_fall_back(monkeypatch):
+    """The scratch is sized by the first call; a wider call must not overrun.
+
+    k1 writes act[r] and k2 reads it with r < topk_ids.shape[1]. A later call
+    with more routes than act has rows would write past the buffer into the
+    adjacent partials, so it goes to CUTLASS instead.
+    """
+    runner = dmg.DraftMoeGemvRunner()
+    sentry = torch.zeros(1, H, dtype=torch.bfloat16)
+    seen = []
+    monkeypatch.setattr(
+        dmg,
+        "draft_moe_gemv",
+        lambda **kw: seen.append(kw["topk_ids"].shape[1]) or sentry,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(
+            (E_FULL, 2 * I, H // 2), dtype=torch.uint8, device="meta"
+        ),
+        w13_blockscale_swizzled=torch.empty(
+            (E_FULL, 2 * I, H // 16), dtype=torch.uint8, device="meta"
+        ),
+        w13_weight_scale_2=torch.ones(E_FULL, 2, device="meta"),
+        w2_weight=torch.empty((E_FULL, H, I // 2), dtype=torch.uint8, device="meta"),
+        w2_blockscale_swizzled=torch.empty(
+            (E_FULL, H, I // 16), dtype=torch.uint8, device="meta"
+        ),
+        w2_weight_scale_2=torch.ones(E_FULL, device="meta"),
+        layer_id=0,
+    )
+
+    d10 = _dispatch(ids=torch.zeros(1, 10, dtype=torch.int64))
+    assert runner.maybe_apply(layer=layer, dispatch_output=d10) is not None
+    assert seen == [10]
+
+    d12 = _dispatch(ids=torch.zeros(1, 12, dtype=torch.int64))
+    assert runner.maybe_apply(layer=layer, dispatch_output=d12) is None, (
+        "a call wider than the act scratch must fall back, not overrun it"
+    )
+    assert seen == [10], "the falling-back call must not reach the kernels"
+
+    # Narrower calls still take the GEMV.
+    d8 = _dispatch(ids=torch.zeros(1, 8, dtype=torch.int64))
+    assert runner.maybe_apply(layer=layer, dispatch_output=d8) is not None
+    assert seen == [10, 8]
+
+
+def test_grad_requiring_input_falls_back(monkeypatch):
+    """A triton launch disconnects autograd silently: refuse it at the gate.
+
+    Same convention as the router GEMV's layout gate -- inside grad mode a
+    tensor that requires grad never takes the shortcut; under no_grad it does.
+    """
+    x = torch.zeros(1, H, dtype=torch.bfloat16, requires_grad=True)
+    with torch.enable_grad():
+        assert not dmg._is_one_token_call(_dispatch(x=x))
+        # A grad-capable weight on the topk side is rejected the same way.
+        wts = torch.ones(1, 10, requires_grad=True)
+        assert not dmg._is_one_token_call(
+            _dispatch(ids=torch.zeros(1, 10, dtype=torch.int64), wts=wts)
+        )
+        assert dmg._is_one_token_call(_dispatch())  # positive control
+    with torch.no_grad():
+        assert dmg._is_one_token_call(_dispatch(x=x))
+
+
 def test_enable_flag_default_off(monkeypatch):
     from sglang.srt.environ import envs
 

@@ -397,6 +397,12 @@ def _is_one_token_call(dispatch_output: StandardDispatchOutput) -> bool:
         and dispatch_output.hidden_states_scale is None
         and topk_output.topk_ids.is_contiguous()
         and topk_output.topk_weights.is_contiguous()
+        # A triton launch disconnects autograd silently; mirror the router
+        # gate's convention and only take the shortcut outside grad mode.
+        and not (
+            torch.is_grad_enabled()
+            and (x.requires_grad or topk_output.topk_weights.requires_grad)
+        )
     )
 
 
@@ -407,6 +413,7 @@ class DraftMoeGemvRunner:
         self._cfg = cfg
         self._workspace: DraftMoeWorkspace | None = None
         self._warned_capture = False
+        self._warned_routes = False
 
     def maybe_apply(
         self, *, layer: FusedMoE, dispatch_output: DispatchOutput
@@ -438,7 +445,22 @@ class DraftMoeGemvRunner:
     def _get_workspace(
         self, *, layer: FusedMoE, dispatch_output: StandardDispatchOutput
     ) -> DraftMoeWorkspace | None:
+        routes = dispatch_output.topk_output.topk_ids.shape[1]
         if self._workspace is not None:
+            # k1 writes act[r] per route and k2 reads it; the scratch is sized
+            # by the first call, so a later call with more routes would write
+            # past act into the adjacent scratch. Hand it to CUTLASS instead.
+            if routes > self._workspace.act.shape[0]:
+                if not self._warned_routes:
+                    logger.warning(
+                        "draft MoE GEMV: a call with %d routes exceeds the "
+                        "%d-row scratch of layer %d; such calls keep CUTLASS",
+                        routes,
+                        self._workspace.act.shape[0],
+                        layer.layer_id,
+                    )
+                    self._warned_routes = True
+                return None
             return self._workspace
         # Allocating inside a capture would put the counters in the graph's pool;
         # the draft graph runners warm up eagerly first, so this is only a guard.
@@ -452,7 +474,7 @@ class DraftMoeGemvRunner:
                 self._warned_capture = True
             return None
         self._workspace = make_workspace(
-            num_routes=dispatch_output.topk_output.topk_ids.shape[1],
+            num_routes=routes,
             hidden_size=layer.w13_weight.shape[2] * 2,
             intermediate_size=layer.w13_weight.shape[1] // 2,
             device=dispatch_output.hidden_states.device,
