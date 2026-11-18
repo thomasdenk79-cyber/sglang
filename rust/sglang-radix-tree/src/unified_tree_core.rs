@@ -4843,6 +4843,36 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         })
     }
 
+    /// Split a node into page-aligned pieces of at most `piece_tokens` so
+    /// each can stage for backup on its own. Returns the piece ids head first
+    /// and the split actions to apply; the node keeps its id, its tail and its
+    /// component state (e.g. the Mamba checkpoint).
+    pub fn split_for_backup(
+        &mut self,
+        node_id: NodeId,
+        piece_tokens: usize,
+    ) -> (Vec<NodeId>, CacheActions) {
+        let Ok(node_idx) = self.arena.resolve(node_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let node = self.arena.node(node_idx);
+        if node.is_root() || !node.has_device_value(FULL) {
+            return (Vec::new(), Vec::new());
+        }
+        let lengths = split_span(node.key.atom_len(), piece_tokens, self.page_size);
+        let mut piece_ids = Vec::with_capacity(lengths.len().max(1));
+        let mut actions: CacheActions = Vec::new();
+        for &length in lengths.iter().take(lengths.len().saturating_sub(1)) {
+            let (head, action) = self.split_node_(node_idx, length);
+            if let Some(action) = action {
+                actions.push(Box::new(action));
+            }
+            piece_ids.push(self.arena.node(head).id);
+        }
+        piece_ids.push(node_id);
+        (piece_ids, actions)
+    }
+
     /// Hash every node built while storage was disabled.
     pub fn backfill_missing_hash_values(&mut self) -> usize {
         let root_id = self.arena.root();
@@ -6808,6 +6838,23 @@ pub enum KvCacheEvent<A> {
     },
     AllBlocksCleared,
 }
+/// Page-aligned piece lengths, each at most `piece_tokens`, covering a span
+/// in order (an unaligned tail stays in the last piece). Mirrors
+/// `buffer_mode.stream.split_span`.
+pub(crate) fn split_span(num_tokens: usize, piece_tokens: usize, page_size: usize) -> Vec<usize> {
+    let piece = page_size.max(piece_tokens - piece_tokens % page_size);
+    let mut lengths = Vec::with_capacity(num_tokens.div_ceil(piece));
+    let mut remaining = num_tokens;
+    while remaining > piece {
+        lengths.push(piece);
+        remaining -= piece;
+    }
+    if remaining > 0 {
+        lengths.push(remaining);
+    }
+    lengths
+}
+
 #[cfg(test)]
 #[path = "tests/unified_tree_core.rs"]
 mod tests;

@@ -498,31 +498,38 @@ class TestFlagOff(unittest.TestCase):
 
 
 class TestSplitForBackup(unittest.TestCase):
-    def test_split_keeps_tail_id_and_hash_chain(self):
+    """Runs against both TreeCores through the shared inspection interface."""
+
+    BACKEND = "python"
+
+    def _build(self):
         cfg = CacheConfig(
             page_size=4, components=(ComponentType.FULL,), kv_size=128, max_context_len=128
         )
         with mock.patch.object(_fixtures, "get_device", return_value="cpu"):
-            cache, allocator, _ = build_fixture(cfg)
+            cache, allocator, _ = build_fixture(cfg, tree_core_backend=self.BACKEND)
+        return cache, allocator
+
+    def test_split_keeps_tail_id_and_hash_chain(self):
+        cache, allocator = self._build()
         tokens = array("q", range(1, 41))
         key = RadixKey(tokens)
         cache.insert(InsertParams(key=key, value=allocator.alloc(len(tokens))))
         leaf = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
         core = cache.tree_core
-        arena = core._node_arena
         # Hashes only exist with storage; seed one per page to follow them.
-        arena[leaf].hash_value = [f"h{i}" for i in range(10)]
+        core.set_node_hash_values(leaf, [f"h{i}" for i in range(10)])
 
         pieces, actions = core.split_for_backup(leaf, 16)
         for action in actions:
             cache._apply_cache_action(action)
 
         self.assertEqual(pieces[-1], leaf)
-        self.assertEqual([len(arena[p].key) for p in pieces], [16, 16, 8])
+        self.assertEqual([core.get_node_key_length(p) for p in pieces], [16, 16, 8])
         for parent, child in zip(pieces, pieces[1:]):
-            self.assertIs(arena[child].parent, arena[parent])
+            self.assertEqual(core.get_parent_node_id(child), parent)
         self.assertEqual(
-            [h for p in pieces for h in arena[p].hash_value],
+            [h for p in pieces for h in core.get_hash_values(p)],
             [f"h{i}" for i in range(10)],
         )
         snap = core.snapshot_buffer_backup(leaf, True)
@@ -531,6 +538,24 @@ class TestSplitForBackup(unittest.TestCase):
             cache.match_prefix(MatchPrefixParams(key=key)).last_device_node, leaf
         )
         cache.sanity_check()
+
+    def test_short_node_and_root_are_not_split(self):
+        cache, allocator = self._build()
+        key = RadixKey(array("q", range(1, 13)))
+        cache.insert(InsertParams(key=key, value=allocator.alloc(12)))
+        leaf = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        core = cache.tree_core
+        self.assertEqual(core.split_for_backup(leaf, 16), ([leaf], []))
+        self.assertEqual(core.split_for_backup(core.root_node_handle(), 4), ([], []))
+        # An unaligned budget rounds down to whole pages.
+        pieces, _ = core.split_for_backup(leaf, 7)
+        self.assertEqual([core.get_node_key_length(p) for p in pieces], [4, 4, 4])
+        self.assertEqual(pieces[-1], leaf)
+        cache.sanity_check()
+
+
+class TestSplitForBackupRust(TestSplitForBackup):
+    BACKEND = "rust"
 
 
 class TestResolveStreamDevice(unittest.TestCase):

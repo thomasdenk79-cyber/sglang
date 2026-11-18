@@ -1283,6 +1283,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             parent_last_hash=state.parent_last_hash,
         )
 
+    def split_for_backup(
+        self, node_id: NodeId, piece_tokens: int
+    ) -> tuple[list[NodeId], list[CacheAction | ComponentAction]]:
+        piece_ids, actions = self._binding.split_for_backup(node_id, piece_tokens)
+        return list(piece_ids), self._cache_actions_from_tagged(actions)
+
     def backfill_missing_hash_values(self) -> int:
         return self._binding.backfill_missing_hash_values()
 
