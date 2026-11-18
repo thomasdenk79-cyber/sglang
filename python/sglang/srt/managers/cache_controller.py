@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     count_pool_hits,
+    l3_page_span,
 )
 
 if TYPE_CHECKING:
@@ -1448,6 +1449,14 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
+        if self._fused_kv_get_enabled():
+            return self._page_get_kv_fused(
+                operation,
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                kv_derived_transfers,
+            )
         # Read from KV pool.
         kv_hits = self.page_get_func(
             operation, batch_hashes, batch_host_indices, extra_info
@@ -1471,6 +1480,52 @@ class HiCacheController:
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
+
+    def _fused_kv_get_enabled(self) -> bool:
+        """The backend reads KV and its sidecars in one batch (HiCacheFile)."""
+        if self.page_get_func != self._generic_page_get:
+            return False
+        enabled = getattr(self.storage_backend, "fused_kv_get_enabled", None)
+        return (
+            enabled is not None
+            and enabled()
+            and l3_page_span(self.storage_host_pool) == self.page_size
+        )
+
+    def _page_get_kv_fused(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """``_generic_page_get`` plus the sidecar read, as one backend batch.
+
+        Same hit count: the KV prefix that was read, clamped to every sidecar's
+        prefix. Pages after the first KV miss may also have been written into
+        the batch's own host slots; they are not counted, so never exposed.
+        """
+        kv_results, sidecar_results = self.storage_backend.batch_get_kv_v2(
+            self.storage_host_pool,
+            batch_hashes,
+            batch_host_indices,
+            [
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=batch_host_indices,
+                    keys=batch_hashes,
+                )
+                for transfer in kv_derived_transfers
+            ],
+            extra_info=extra_info,
+        )
+        kv_hits = count_pool_hits({PoolName.KV: kv_results})[PoolName.KV]
+        if kv_hits < len(batch_hashes):
+            logger.warning(
+                f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes[kv_hits]}."
+            )
+        return min([kv_hits, *count_pool_hits(sidecar_results).values()])
 
     def _prefetch_producers_alive(self) -> bool:
         """Whether a thread other than the scheduler may still put operations

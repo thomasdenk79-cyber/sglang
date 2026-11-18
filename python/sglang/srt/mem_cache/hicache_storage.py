@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import logging
 import os
@@ -13,7 +14,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
 
 import torch
-
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -25,6 +25,35 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 # O_DIRECT needs the buffer address, length and file offset on this alignment.
 _DIRECT_IO_ALIGN = 4096
+
+
+def _address_buffer(address: int, num_bytes: int) -> memoryview:
+    """Writable byte view of ``num_bytes`` of host memory at ``address``."""
+    return memoryview((ctypes.c_ubyte * num_bytes).from_address(address)).cast("B")
+
+
+def _preadv_into(fd: int, buffers: list, offset: int = 0) -> int:
+    """Fill ``buffers`` from ``fd`` starting at ``offset``; stop at end of file.
+
+    Returns the bytes read. A short read that leaves data pending is retried;
+    a read of 0 bytes (end of file) ends the loop.
+    """
+    pending = [b for b in buffers if len(b)]
+    want = sum(len(b) for b in pending)
+    done = 0
+    while pending:
+        n = os.preadv(fd, pending, offset + done)
+        if n <= 0:
+            break
+        done += n
+        if done == want:
+            break
+        while pending and n >= len(pending[0]):
+            n -= len(pending[0])
+            pending.pop(0)
+        if n:
+            pending[0] = pending[0][n:]
+    return done
 
 
 @dataclass
@@ -917,6 +946,11 @@ class HiCacheFile(HiCacheStorage):
         )
 
         self._init_config_suffix(storage_config)
+        # Unified chunk keys keep the staged read (all chunks or nothing).
+        self.zero_copy_read = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_ZERO_COPY_READ.get()
+            and self._unified_suffixes is None
+        )
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
 
@@ -1073,7 +1107,7 @@ class HiCacheFile(HiCacheStorage):
                 self.direct_io
                 and expected % _DIRECT_IO_ALIGN == 0
                 and target_location.data_ptr() % _DIRECT_IO_ALIGN == 0
-                and self._read_direct(tensor_path, buf, expected, suffixed)
+                and self._read_direct(tensor_path, [buf], expected, suffixed)
             ):
                 with open(tensor_path, "rb", buffering=0) as f:
                     if os.fstat(f.fileno()).st_size != expected:
@@ -1091,8 +1125,8 @@ class HiCacheFile(HiCacheStorage):
             return None
 
     @staticmethod
-    def _read_direct(path: str, buf: memoryview, expected: int, suffixed: str) -> bool:
-        """O_DIRECT read into an aligned buffer, bypassing the page cache.
+    def _read_direct(path: str, bufs: list, expected: int, suffixed: str) -> bool:
+        """O_DIRECT read into aligned buffers (in order), bypassing the page cache.
         False if the filesystem refuses O_DIRECT (the caller reads buffered)."""
         try:
             fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
@@ -1103,20 +1137,61 @@ class HiCacheFile(HiCacheStorage):
         try:
             if os.fstat(fd).st_size != expected:
                 raise IOError(f"Incorrect object size for {suffixed}")
-            done = 0
-            while done < expected:
-                try:
-                    n = os.preadv(fd, [buf[done:]], done)
-                except OSError as e:
-                    if e.errno == errno.EINVAL and done == 0:
-                        return False
-                    raise
-                if n <= 0:
-                    raise IOError(f"Short read for {suffixed}")
-                done += n
+            try:
+                done = _preadv_into(fd, bufs)
+            except OSError as e:
+                if e.errno == errno.EINVAL:
+                    return False
+                raise
+            if done != expected:
+                raise IOError(f"Short read for {suffixed}")
             return True
         finally:
             os.close(fd)
+
+    def _read_segments(self, suffixed: str, segments) -> bool:
+        """Read one page file straight into host memory runs (zero-copy).
+
+        ``segments`` are ``(address, nbytes)`` runs from the host pool's
+        ``flat_page_segments``. Safe on a read-pool thread: it touches only the
+        file, the given runs (owned by the caller's transfer) and the
+        thread-safe evictor / metadata cache. A missing, short or oversized
+        file is a miss (False); the runs may then hold part of the page, which
+        the caller must not count as restored (as with a staged miss, whose
+        slots keep stale bytes).
+        """
+        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        bufs = [_address_buffer(addr, nbytes) for addr, nbytes in segments]
+        expected = sum(nbytes for _, nbytes in segments)
+        try:
+            if not (
+                self.direct_io
+                and all(
+                    addr % _DIRECT_IO_ALIGN == 0 and nbytes % _DIRECT_IO_ALIGN == 0
+                    for addr, nbytes in segments
+                )
+                and self._read_direct(tensor_path, bufs, expected, suffixed)
+            ):
+                fd = os.open(tensor_path, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    # One spare byte flags an oversized file without an fstat.
+                    done = _preadv_into(fd, bufs + [bytearray(1)])
+                finally:
+                    os.close(fd)
+                if done != expected:
+                    raise IOError(
+                        f"Incorrect object size for {suffixed}: "
+                        f"{'>' if done > expected else ''}{done} != {expected}"
+                    )
+            self._evictor.touch(suffixed, tensor_path)
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
+            return True
+        except OSError:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
+            return False
 
     def batch_get(
         self,
@@ -1129,15 +1204,7 @@ class HiCacheFile(HiCacheStorage):
             list(zip(keys, target_locations or [None] * len(keys))),
         )
 
-    def _map_reads(self, fn, items: list) -> list:
-        """[fn(x) for x in items], on the read pool when read_workers > 1.
-
-        Returns only after every read has finished (they write into caller-owned
-        buffers), in input order, so callers see the same results as a serial
-        loop. A read that raises becomes a miss (None).
-        """
-        if self.read_workers <= 1 or len(items) <= 1:
-            return [fn(x) for x in items]
+    def _get_read_pool(self):
         if self._read_pool is None:
             with self._read_pool_lock:
                 if self._read_pool is None:
@@ -1147,7 +1214,19 @@ class HiCacheFile(HiCacheStorage):
                         max_workers=self.read_workers,
                         thread_name_prefix="hicache-file-read",
                     )
-        futures = [self._read_pool.submit(fn, x) for x in items]
+        return self._read_pool
+
+    def _map_reads(self, fn, items: list) -> list:
+        """[fn(x) for x in items], on the read pool when read_workers > 1.
+
+        Returns only after every read has finished (they write into caller-owned
+        buffers), in input order, so callers see the same results as a serial
+        loop. A read that raises becomes a miss (None).
+        """
+        if self.read_workers <= 1 or len(items) <= 1:
+            return [fn(x) for x in items]
+        pool = self._get_read_pool()
+        futures = [pool.submit(fn, x) for x in items]
         results = []
         for future in futures:
             try:
@@ -1370,6 +1449,18 @@ class HiCacheFile(HiCacheStorage):
         return self.set(storage_key, data_page)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
+        if op_fn == self._read_page and self.zero_copy_read:
+            return self._batch_read_v2(
+                [
+                    (
+                        t.name,
+                        self.registered_pools[t.name],
+                        t.keys or [],
+                        t.host_indices,
+                    )
+                    for t in transfers
+                ]
+            )
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
@@ -1427,6 +1518,118 @@ class HiCacheFile(HiCacheStorage):
                     host_pool.set_from_flat_data_page(page_offset, page)
                     out.append(True)
         return out
+
+    def _zero_copy_segments(self, host_pool, offsets: List[int]):
+        """Per-page host runs for ``offsets``, or None to stage the pool."""
+        if l3_page_span(host_pool) != getattr(host_pool, "page_size", None):
+            return None  # DCP-widened keys: stage through the pool's own setter
+        segments_fn = getattr(host_pool, "flat_page_segments", None)
+        if segments_fn is None:
+            return None
+        segments = []
+        for offset in offsets:
+            segs = segments_fn(offset)
+            if not segs:
+                return None
+            segments.append(segs)
+        return segments
+
+    def _batch_read_v2(self, items: list) -> dict[str, List[bool]]:
+        """Read ``(name, host_pool, keys, host_indices)`` items into host pools.
+
+        Pools exposing ``flat_page_segments`` are read zero-copy: every page
+        file of every such pool is submitted to the read pool at once (no
+        per-pool or per-chunk barrier) and lands directly in host memory.
+        Segments are resolved here, on the calling thread; the read threads
+        only fill them. Other pools take the staged path, whose
+        ``set_from_flat_data_page`` stays on the calling thread. Returns only
+        after every read finished. Results match ``_read_page`` per page.
+        """
+        results: dict[str, List[bool]] = {}
+        direct = []
+        staged = []
+        for name, host_pool, keys, host_indices in items:
+            page_size = l3_page_span(host_pool)
+            expected = len(keys) * page_size
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "_read_page indices length mismatch for %s: expected %s, got %s",
+                    name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[name] = [False] * len(keys)
+                continue
+            if not keys:
+                results[name] = []
+                continue
+            offsets = host_indices[::page_size].tolist()
+            segments = self._zero_copy_segments(host_pool, offsets)
+            if segments is None:
+                staged.append((name, host_pool, keys, offsets))
+                continue
+            suffixed = [self._get_suffixed_key(self._log_key(name, k)) for k in keys]
+            direct.append((name, suffixed, segments))
+
+        parallel = self.read_workers > 1 and sum(len(d[1]) for d in direct) > 1
+        if parallel:
+            pool = self._get_read_pool()
+            pending = [
+                (name, [pool.submit(self._read_segments, *a) for a in zip(sx, segs)])
+                for name, sx, segs in direct
+            ]
+        else:
+            for name, sx, segs in direct:
+                results[name] = [self._read_segments(*a) for a in zip(sx, segs)]
+
+        for name, host_pool, keys, offsets in staged:
+            args = [(name, key, host_pool, o) for key, o in zip(keys, offsets)]
+            if self.read_workers > 1 and len(args) > 1:
+                results[name] = self._read_pages_parallel(host_pool, args)
+            else:
+                results[name] = [self._read_page(*a) for a in args]
+
+        if parallel:
+            for name, futures in pending:
+                out = []
+                for future in futures:
+                    try:
+                        out.append(bool(future.result()))
+                    except Exception as e:
+                        logger.error(f"HiCacheFile parallel read failed: {e}")
+                        out.append(False)
+                results[name] = out
+        # Keep the caller's pool order.
+        return {name: results[name] for name, *_ in items}
+
+    def fused_kv_get_enabled(self) -> bool:
+        """Whether the controller may read KV pages through batch_get_kv_v2.
+
+        Subclasses keep their own read path unless they opt in."""
+        return self.zero_copy_read and type(self) is HiCacheFile
+
+    def batch_get_kv_v2(
+        self,
+        kv_host_pool,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        sidecar_transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> tuple[List[bool], dict[str, List[bool]]]:
+        """Read KV pages into ``kv_host_pool`` together with KV-indexed sidecars.
+
+        Same files and per-page results as ``batch_get`` for KV (followed by
+        ``set_from_flat_data_page``) plus ``batch_get_v2`` for the sidecars, but
+        all pools' reads overlap in one zero-copy batch.
+        """
+        items = [(PoolName.KV, kv_host_pool, keys, host_indices)]
+        items += [
+            (t.name, self.registered_pools[t.name], t.keys or [], t.host_indices)
+            for t in sidecar_transfers
+        ]
+        results = self._batch_read_v2(items)
+        kv = results.pop(PoolName.KV)
+        return kv, results
 
     def batch_get_v2(
         self,

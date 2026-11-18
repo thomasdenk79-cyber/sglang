@@ -773,6 +773,29 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def flat_page_segments(self, index: int):
+        if (
+            type(self).set_from_flat_data_page
+            is not DeepSeekV4PagedHostPool.set_from_flat_data_page
+        ):
+            return None
+        index = int(index)
+        if index % self.slot_page_size:
+            return None
+        row = index // self.slot_page_size
+        if self.layout == "layer_first":
+            if not all(buf.is_contiguous() for buf in self.kv_buffer):
+                return None
+            run = self.item_bytes * self.dtype.itemsize
+            return tuple((buf.data_ptr() + row * run, run) for buf in self.kv_buffer)
+        if self.layout in ("page_first", "page_first_direct"):
+            buf = self.kv_buffer
+            if not buf.is_contiguous():
+                return None
+            run = buf.stride(0) * buf.element_size()
+            return ((buf.data_ptr() + row * run, run),)
+        return None
+
     def get_page_buffer_meta(self, indices):
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
