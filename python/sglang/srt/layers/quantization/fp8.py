@@ -1443,7 +1443,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
-        if self._mxfp8_skinny_gemv_enabled():
+        if self._mxfp8_skinny_gemv_enabled(layer.weight.device):
             # Materialize the skinny GEMV's per-stream split-K scratch here:
             # warm-up runs at prefill widths, where apply() never reaches the
             # GEMV, so the first split-K call would otherwise allocate inside a
@@ -1453,12 +1453,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
             prealloc(layer.weight.device)
 
-    def _mxfp8_skinny_gemv_enabled(self) -> bool:
+    def _mxfp8_skinny_gemv_enabled(self, device: Optional[torch.device] = None) -> bool:
         """Whether this method may route dense MXFP8 linears to the skinny GEMV.
 
         The method-wide half of the gate: an opt-in flag, an MXFP8 checkpoint on
         an SM120 CUDA part, and a dense backend that leaves the weight and the
-        UE8M0 scale in the layout the kernel reads.
+        UE8M0 scale in the layout the kernel reads. ``device`` is the layer's, so
+        a heterogeneous process asks about the GPU that would run the kernel.
         """
         if not (self.use_mxfp8 and _is_cuda and not self.use_marlin):
             return False
@@ -1466,7 +1467,7 @@ class Fp8LinearMethod(LinearMethodBase):
             return False
         from sglang.srt.layers.quantization import mxfp8_skinny_gemv
 
-        if not mxfp8_skinny_gemv.is_sm120():
+        if not mxfp8_skinny_gemv.is_sm120(device):
             return False
         backend = self.mxfp8_dense_backend
         # Only the FlashInfer CUTLASS / CuTe-DSL backends keep layer.weight
@@ -1488,15 +1489,15 @@ class Fp8LinearMethod(LinearMethodBase):
             # A (fp8, scale) pair or an Mxfp8SwizzledInput belongs to the W8A8
             # GEMM it was quantized for; a bias is not fused into the GEMV.
             return False
-        if not self._mxfp8_skinny_gemv_enabled():
+        weight = getattr(layer, "weight", None)
+        scale = getattr(layer, "weight_scale_inv", None)
+        if weight is None or scale is None:
+            return False
+        if not self._mxfp8_skinny_gemv_enabled(weight.device):
             return False
         if getattr(layer, "dequantized_bf16", False) or getattr(
             layer, "aiter_bpreshuffled", False
         ):
-            return False
-        scale = getattr(layer, "weight_scale_inv", None)
-        weight = getattr(layer, "weight", None)
-        if scale is None or weight is None:
             return False
         from sglang.srt.layers.quantization import mxfp8_skinny_gemv
 
