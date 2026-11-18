@@ -62,6 +62,16 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_compressed_kv
 
 
+def _has_qsa_nvfp4_kv(pool) -> bool:
+    """Whether ``pool`` (or its full-attention child) stores QSA NVFP4 KV."""
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        QSANVFP4KVCacheMethod,
+    )
+
+    pool = getattr(pool, "full_kv_pool", pool)
+    return isinstance(getattr(pool, "quant_method", None), QSANVFP4KVCacheMethod)
+
+
 def _check_hicache_draft_dcp_layout(
     mode: HiCacheDraftMode, draft_pools: tuple[object, ...]
 ) -> None:
@@ -326,7 +336,21 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        # Packed MTP shares the target's host rows and pool set, which needs
+        # identical KV geometry; NVFP4 target pages carry scale sidecars a
+        # FP8/BF16 draft lacks, so the draft gets its own sidecar host pool.
+        if any(_has_qsa_nvfp4_kv(pool) for pool in draft_pools):
+            raise NotImplementedError(
+                "HiCache does not support an NVFP4 draft KV cache; use "
+                "--speculative-draft-kv-cache-dtype fp8_e4m3 or bfloat16."
+            )
+        if _has_qsa_nvfp4_kv(target_model_runner.token_to_kv_pool):
+            if len(draft_pools) != 1:
+                raise NotImplementedError(
+                    "HiCache with NVFP4 target KV supports one draft KV pool, "
+                    f"got {len(draft_pools)}."
+                )
+        elif _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (
