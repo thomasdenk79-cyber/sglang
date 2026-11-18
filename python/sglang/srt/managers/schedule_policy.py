@@ -57,7 +57,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
-from sglang.srt.mem_cache.allocation import retire_window
+from sglang.srt.mem_cache.allocation import ensure_mamba_capacity, retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -68,6 +68,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -1945,6 +1946,22 @@ class PrefillAdder:
                 )
             ):
                 return AddReqResult.OTHER
+
+            state = self.token_to_kv_pool_allocator.state
+            if isinstance(state, StateStorage) and not ensure_mamba_capacity(
+                self.tree_cache.req_to_token_pool,
+                state,
+                [*self.can_run_list, req],
+                self.tree_cache,
+            ):
+                if (
+                    isinstance(self.tree_cache, UnifiedRadixCache)
+                    and self.tree_cache.buffer_pipeline is not None
+                ):
+                    self.tree_cache.buffer_pipeline.defer_staged_admission(
+                        req, "mamba"
+                    )
+                return AddReqResult.NO_TOKEN
 
             # Reserve sharded scratch before any load-back is queued: a load
             # must be consumed by this batch, whose prefix gather waits on it.
