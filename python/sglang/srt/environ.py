@@ -46,12 +46,17 @@ def _default_on_in_ci() -> bool:
 class EnvField:
     _allow_set_name = True
 
-    def __init__(self, default: Any, secret: bool = False):
+    def __init__(self, default: Any, secret: bool = False, strict: bool = False):
         self.default = default
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        # strict: an unparsable value raises instead of warning and falling back
+        # to the default. For knobs whose default silently disables a feature
+        # the operator believes is on (e.g. the prune tau), so a typo must not
+        # turn a pruned arm into the un-pruned baseline.
+        self.strict = strict
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -80,6 +85,8 @@ class EnvField:
         try:
             return self.parse(value)
         except ValueError as e:
+            if self.strict:
+                raise ValueError(f"Invalid value for {self.name}: {e}") from e
             default = self._resolve_default()
             warnings.warn(
                 f'Invalid value for {self.name}: {e}, using default "{default}"'
@@ -153,6 +160,23 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvBoolCompat(EnvBool):
+    """``EnvBool`` that also accepts on/enable and off/disable.
+
+    For knobs ported from HyperBurst, whose launcher scripts and docs already
+    spell these values; pair with ``strict=True`` so unknown spellings raise
+    instead of silently leaving the knob off.
+    """
+
+    def parse(self, value: str) -> bool:
+        value = value.lower()
+        if value in ["true", "1", "yes", "y", "on", "enable"]:
+            return True
+        if value in ["false", "0", "no", "n", "off", "disable"]:
+            return False
+        raise ValueError(f'"{value}" is not a valid boolean value')
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -169,8 +193,14 @@ class _DeprecatedEnvFallback:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
     """
 
-    def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
-        super().__init__(default, secret=secret)
+    def __init__(
+        self,
+        default: Any,
+        deprecated_name: str,
+        secret: bool = False,
+        strict: bool = False,
+    ):
+        super().__init__(default, secret=secret, strict=strict)
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
@@ -1514,9 +1544,10 @@ class Envs:
     # but keeps the id (equivalence control without the GEMM saving). RENORM
     # restores a pruned row's routed weight sum.
     # SGLANG_MOE_PRUNE_SINGLETON_TAU (HyperBurst's spelling) is the accepted
-    # deprecated alias of this knob.
+    # deprecated alias of this knob. Strict: an unparsable value (e.g. "0,08")
+    # raises at the first prune call instead of silently disabling pruning.
     SGLANG_MOE_SINGLETON_PRUNE_TAU = EnvFloatWithAlias(
-        0.0, deprecated_name="SGLANG_MOE_PRUNE_SINGLETON_TAU"
+        0.0, deprecated_name="SGLANG_MOE_PRUNE_SINGLETON_TAU", strict=True
     )
     SGLANG_MOE_PRUNE_MIN_RANK = EnvInt(1)
     SGLANG_MOE_PRUNE_MIN_ROWS = EnvInt(2)
@@ -1620,7 +1651,9 @@ class Envs:
     # Programmatic dependent launch for the fork's Triton kernels that do not
     # carry PDL already; see python/sglang/kernels/triton_pdl.py. No-op off
     # sm_90+ and when unset, where the PTX and launch configs stay unmodified.
-    SGLANG_TRITON_PDL = EnvBool(False)
+    # Accepts HyperBurst's on/enable spellings; any other invalid value raises
+    # at the first instrumented launch instead of silently staying off.
+    SGLANG_TRITON_PDL = EnvBoolCompat(False, strict=True)
 
     # ===================================================================
     # Expert parallel load balancing

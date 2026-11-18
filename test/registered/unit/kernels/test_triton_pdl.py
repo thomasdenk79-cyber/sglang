@@ -48,6 +48,26 @@ def test_prune_tau_canonical_and_hb_alias(monkeypatch):
     monkeypatch.setenv("SGLANG_MOE_PRUNE_SINGLETON_TAU", "0.10")
     with pytest.warns(FutureWarning, match="SGLANG_MOE_PRUNE_SINGLETON_TAU"):
         assert tau() == 0.10
+    # An unparsable value raises instead of silently falling back to tau=0, on
+    # either spelling. Direct os.environ use: the alias path copies the
+    # deprecated value under the canonical name outside monkeypatch's tracking.
+    for name in (
+        "SGLANG_MOE_PRUNE_SINGLETON_TAU",
+        "SGLANG_MOE_SINGLETON_PRUNE_TAU",
+    ):
+        # The previous case left the canonical name set by the fallback copy;
+        # start each invalid-value check from a clean environment.
+        os.environ.pop("SGLANG_MOE_PRUNE_SINGLETON_TAU", None)
+        os.environ.pop("SGLANG_MOE_SINGLETON_PRUNE_TAU", None)
+        os.environ[name] = "0,08"
+        try:
+            ps.get_prune_config.cache_clear()
+            with pytest.raises(ValueError, match="SGLANG_MOE_SINGLETON_PRUNE_TAU"):
+                ps.get_prune_config()
+        finally:
+            ps.get_prune_config.cache_clear()
+            os.environ.pop(name, None)
+            os.environ.pop("SGLANG_MOE_SINGLETON_PRUNE_TAU", None)
 
 
 def test_triton_pdl_env_registration(monkeypatch):
@@ -58,52 +78,87 @@ def test_triton_pdl_env_registration(monkeypatch):
         monkeypatch.setenv("SGLANG_TRITON_PDL", value)
         assert envs.SGLANG_TRITON_PDL.get() is want
     # Off must short-circuit before any device query: the CPU CI box has no
-    # CUDA and a True default (or an eager device probe) breaks every import.
-    assert triton_pdl.PDL is False
+    # CUDA and an eager device probe would break every launch. The accessor
+    # reads live state, so it stays False here without touching CUDA.
     assert triton_pdl.triton_pdl_enabled() is False
 
 
-def _patch_cuda(monkeypatch, capability, device_raises=False):
-    def current_device():
-        if device_raises:
-            raise RuntimeError("no CUDA device")
-        return 0
-
-    monkeypatch.setattr(torch.cuda, "current_device", current_device)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _dev: capability)
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
-    monkeypatch.setattr(torch.version, "musa", None, raising=False)
+def _stub_device(monkeypatch, supports: bool) -> None:
+    monkeypatch.setattr(triton_pdl, "_device_supports_pdl", lambda: supports)
 
 
 @pytest.mark.parametrize(
-    "flag,capability,hip,device_raises,want",
+    ("value", "want"),
     [
-        (None, (12, 0), None, False, False),
-        ("1", (12, 0), None, False, True),
-        ("1", (9, 0), None, False, True),
-        ("1", (8, 9), None, False, False),
-        ("1", (12, 0), "6.4", False, False),
-        ("1", (12, 0), None, True, False),
+        ("1", True),
+        ("true", True),
+        ("True", True),
+        ("yes", True),
+        ("y", True),
+        ("on", True),
+        ("ENABLE", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("n", False),
+        ("off", False),
+        ("disable", False),
     ],
 )
-def test_detect_gate_matrix(monkeypatch, flag, capability, hip, device_raises, want):
-    """PDL turns on only for flag-set, non-ROCm/CUDA, sm_90-or-later."""
-    if flag is None:
-        monkeypatch.delenv("SGLANG_TRITON_PDL", raising=False)
-    else:
-        monkeypatch.setenv("SGLANG_TRITON_PDL", flag)
-    _patch_cuda(monkeypatch, capability, device_raises)
-    if hip is not None:
-        monkeypatch.setattr(torch.version, "hip", hip)
-    assert triton_pdl._detect() is want
+def test_pdl_enabled_flag_spellings(monkeypatch, value, want):
+    """Registry, standalone fallback and the accessor accept the same words.
+
+    "on"/"enable" are the spellings the ported HyperBurst launch scripts use.
+    """
+    monkeypatch.setenv("SGLANG_TRITON_PDL", value)
+    _stub_device(monkeypatch, True)
+    assert triton_pdl.triton_pdl_enabled() is want
+
+
+@pytest.mark.parametrize("value", ["banana", "2", "0,08", ""])
+def test_pdl_invalid_value_raises_on_both_paths(monkeypatch, value):
+    """A half-parsed flag is an error, not a silently-off baseline."""
+    monkeypatch.setenv("SGLANG_TRITON_PDL", value)
+    with pytest.raises(ValueError, match="SGLANG_TRITON_PDL"):
+        triton_pdl._flag_set()
+    monkeypatch.setitem(sys.modules, "sglang.srt.environ", None)
+    with pytest.raises(ValueError, match="SGLANG_TRITON_PDL"):
+        triton_pdl._flag_set()
+
+
+def test_pdl_enabled_requires_flag_and_device(monkeypatch):
+    """Flag off wins over a supporting device, and vice versa."""
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "0")
+    _stub_device(monkeypatch, True)
+    assert triton_pdl.triton_pdl_enabled() is False
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    _stub_device(monkeypatch, False)
+    assert triton_pdl.triton_pdl_enabled() is False
+    _stub_device(monkeypatch, True)
+    assert triton_pdl.triton_pdl_enabled() is True
+
+
+def test_pdl_device_probe_never_raises(monkeypatch):
+    """A driver failure in the tree-wide predicate must not escape a launch."""
+    import sglang.kernels.jit.utils as jit_utils
+
+    def boom() -> bool:
+        raise RuntimeError("no driver")
+
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", boom)
+    triton_pdl._device_supports_pdl.cache_clear()
+    try:
+        assert triton_pdl.triton_pdl_enabled() is False
+    finally:
+        triton_pdl._device_supports_pdl.cache_clear()
 
 
 def test_flag_read_without_srt_falls_back_to_os_environ(monkeypatch):
     """The kernels package is importable standalone (no sglang.srt on path)."""
     monkeypatch.setenv("SGLANG_TRITON_PDL", "yes")
     monkeypatch.setitem(sys.modules, "sglang.srt.environ", None)
-    _patch_cuda(monkeypatch, (12, 0))
-    assert triton_pdl._detect() is True
+    assert triton_pdl._flag_set() is True
 
 
 def _prune_case():

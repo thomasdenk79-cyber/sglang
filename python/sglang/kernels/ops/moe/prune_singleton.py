@@ -29,11 +29,12 @@ routing mass.
 
 The work is one single-CTA Triton kernel over the ``[M, k]`` top-k tensors, in
 place, without host sync or allocation, so it is CUDA-graph capturable once
-the histogram scratch exists. The launch honours ``SGLANG_TRITON_PDL`` (see
-``sglang.kernels.triton_pdl``); with the flag off the PTX and the launch
-config are identical to the un-instrumented kernel.
-It changes the model output (lossy); defaults
+the histogram scratch exists. It changes the model output (lossy); defaults
 leave it off.
+
+The launch honours ``SGLANG_TRITON_PDL`` (see ``sglang.kernels.triton_pdl``);
+with the flag off the PTX and the launch config are identical to the
+un-instrumented kernel.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
+from sglang.kernels.triton_pdl import pdl_trigger, pdl_wait, triton_pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +314,7 @@ def maybe_prune_singleton_routes_(
                 num_expert_slots, dtype=torch.int32, device=topk_ids.device
             )
             _COUNTS[key] = cnt
+    pdl = triton_pdl_enabled()
     _kernel()[(1,)](
         topk_ids,
         topk_weights,
@@ -328,8 +330,8 @@ def maybe_prune_singleton_routes_(
         SENTINEL_=SENTINEL,
         KEEP_IDS=cfg.keep_ids,
         PAIRWISE=cnt is None,
-        USE_PDL=PDL,
-        launch_pdl=PDL,
+        USE_PDL=pdl,
+        launch_pdl=pdl,
         num_warps=4,
     )
     if before is not None:

@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import _gdn_gating_values
-from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
+from sglang.kernels.triton_pdl import pdl_trigger, pdl_wait, triton_pdl_enabled
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
@@ -328,6 +328,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     if _use_aiter:
         v_elems_per_program = (num_heads_v // num_heads_qk) * head_v
         num_warps = 1 if v_elems_per_program <= 512 else 4
+    pdl = triton_pdl_enabled()
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -342,10 +343,10 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         head_qk,
         head_v,
         V_POW2=(v_per_group & (v_per_group - 1)) == 0,
-        USE_PDL=PDL,
+        USE_PDL=pdl,
         num_warps=num_warps,
         num_stages=3,
-        launch_pdl=PDL,
+        launch_pdl=pdl,
     )
     return mixed_qkv, z, b, a
 

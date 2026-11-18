@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
+from sglang.kernels.triton_pdl import pdl_trigger, pdl_wait, triton_pdl_enabled
 
 
 @triton.jit
@@ -492,6 +492,7 @@ def _launch(
     z, nw, norm_g, norm_eps, norm_sigmoid = (x, x, 0, 0.0, False)
     if norm is not None:
         z, nw, norm_g, norm_eps, norm_sigmoid = norm
+    pdl = triton_pdl_enabled()
     _w8a16_gemv_kernel[(n_blocks, splits)](
         x,
         w,
@@ -523,8 +524,8 @@ def _launch(
         EVEN_K=K % block_k == 0,
         W_KN=(w.stride(0) == 1) if w_kn is None else w_kn,
         USE_DOT=use_dot,
-        USE_PDL=PDL,
-        launch_pdl=PDL,
+        USE_PDL=pdl,
+        launch_pdl=pdl,
         SEG_NB0=seg_nb0,
         NORM_G=norm_g,
         NORM_SIGMOID=norm_sigmoid,

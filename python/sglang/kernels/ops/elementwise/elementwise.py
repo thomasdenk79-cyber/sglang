@@ -4,7 +4,7 @@ import triton.language as tl
 from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.triton_pdl import PDL as _TRITON_PDL
+from sglang.kernels.triton_pdl import triton_pdl_enabled
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
@@ -119,6 +119,7 @@ def fused_sigmoid_mul(
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+    pdl_trigger_on = triton_pdl_enabled()
     _fused_sigmoid_mul_kernel[grid](
         out,
         attn_output,
@@ -130,7 +131,7 @@ def fused_sigmoid_mul(
         BLOCK_H=block_h,
         ROUND_SIGMOID=round_sigmoid,
         USE_PDL=use_pdl,
-        GDC_TRIGGER=_TRITON_PDL,
+        GDC_TRIGGER=pdl_trigger_on,
         num_warps=4,
         **kwargs,
         **pdl_kwargs,
