@@ -75,7 +75,10 @@ from sglang.srt.speculative.draft_parallel import (
     resolve_draft_parallel_layout,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.dynamic_draft_vocab import DynamicDraftVocab
+from sglang.srt.speculative.dynamic_draft_vocab import (
+    DynamicDraftVocab,
+    DynamicVocabConfig,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -469,12 +472,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             head,
             num_slots,
             self.target_worker.model_config.vocab_size,
+            config=DynamicVocabConfig.from_env(),
         )
         self.dynamic_vocab = dynamic_vocab
         self.hot_token_id = dynamic_vocab.hot_token_id
         logger.info(
-            f"Dynamic draft vocabulary: {dynamic_vocab.num_hot} static + "
-            f"{num_slots} ring tokens."
+            f"Dynamic draft vocabulary ({dynamic_vocab.policy}): "
+            f"{dynamic_vocab.num_hot} static + {dynamic_vocab.num_ring} ring + "
+            f"{dynamic_vocab.num_pool} pool = {dynamic_vocab.num_rows} rows."
         )
         return dynamic_vocab.head
 
@@ -1142,7 +1147,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.dynamic_vocab is not None and not batch.forward_mode.is_idle():
             # Committed at the next decode draft extend; see DynamicDraftVocab.
             self.dynamic_vocab.stage(batch.input_ids)
-            self.dynamic_vocab.stage(next_token_ids)
+            self.dynamic_vocab.stage(next_token_ids, output=True)
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1270,7 +1275,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         accept_lens = batch_result.accept_lens.to(accepted.device)
         lanes = torch.arange(accepted.shape[1], device=accepted.device)
-        self.dynamic_vocab.stage(accepted, lanes < accept_lens.unsqueeze(1))
+        self.dynamic_vocab.stage(
+            accepted, lanes < accept_lens.unsqueeze(1), output=True
+        )
         self.dynamic_vocab.commit()
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
