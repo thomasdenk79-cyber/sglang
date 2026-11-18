@@ -1097,6 +1097,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
+        fused = self._fused_norm_out_proj(core_attn_out, z, z_shape_og)
+        if fused is not None:
+            return fused
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1106,6 +1110,60 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _fused_norm_out_proj(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        z_shape_og,
+    ) -> Optional[torch.Tensor]:
+        """The gated RMSNorm and the out_proj GEMV in one launch, or None.
+
+        ``RMSNormGated`` normalises per (token, v-head) over ``head_v_dim`` and
+        the out_proj consumes the [tokens, num_v_heads * head_v_dim] view of
+        exactly those bytes, so with BLOCK_K == head_v_dim one GEMV A tile is
+        one norm group and the standalone norm kernel only moves the rows to
+        another kernel. None -- run the norm and the linear -- is returned for
+        anything this checkpoint's kernel was not measured on; see
+        ``layers/quantization/mxfp8_norm_gated_gemv.py``.
+        """
+        from sglang.srt.layers.quantization import mxfp8_norm_gated_gemv
+
+        if not (mxfp8_norm_gated_gemv.enabled() and _is_cuda) or len(z_shape_og) != 3:
+            return None
+        apply_norm = getattr(self.out_proj.quant_method, "apply_norm_gated", None)
+        if apply_norm is None:
+            return None
+        g = self.head_v_dim
+        tokens, heads, head_dim = z_shape_og
+        if (
+            self.out_proj.tp_size != 1
+            or getattr(self.out_proj, "use_decode_attn_tp", False)
+            or self.out_proj.bias is not None
+            or self.norm.group_size is not None
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.weight.shape != (g,)
+            or core_attn_out.dim() != 2
+            or core_attn_out.shape[1] != g
+            or head_dim != g
+            or core_attn_out.shape != z.shape
+            or core_attn_out.shape[0] != tokens * heads
+            or tokens <= 0
+            or not core_attn_out.is_contiguous()
+            or not z.is_contiguous()
+        ):
+            return None
+        k = heads * g
+        return apply_norm(
+            self.out_proj,
+            core_attn_out.view(tokens, k),
+            z.view(tokens, k),
+            self.norm.weight,
+            g,
+            self.norm.eps,
+            getattr(self.norm, "activation", "swish"),
+        )
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):

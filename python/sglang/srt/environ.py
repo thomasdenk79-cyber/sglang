@@ -1493,6 +1493,11 @@ class Envs:
     # (layers/moe/router_gemv.py). Bias-free gates keep BF16 logits through the
     # in-tree skinny GEMV; a gate with a bias gets FP32 logits.
     SGLANG_ROUTER_GEMV = EnvBool(False)
+    # Opt-in: fold the GDN gated RMSNorm (RMSNormGated over head_v_dim,
+    # norm_before_gate) into the A-load of the MXFP8 out_proj GEMV
+    # (layers/quantization/mxfp8_norm_gated_gemv.py). Measured shapes only;
+    # every other call keeps the separate norm kernel.
+    SGLANG_NORM_INTO_GEMV = EnvBool(False)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS

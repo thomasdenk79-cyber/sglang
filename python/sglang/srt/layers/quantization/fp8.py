@@ -1443,6 +1443,82 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+        if self._fused_norm_gemv_enabled(layer.weight.device):
+            # Materialize the fused GEMV's per-stream split-K scratch here: the
+            # warm-up runs at prefill widths, where the hook never reaches the
+            # GEMV, so the first decode call would otherwise allocate inside a
+            # CUDA graph capture and bake the scratch into that graph's pool.
+            from sglang.srt.layers.quantization.mxfp8_norm_gated_gemv import prealloc
+
+            prealloc(layer.weight.device)
+
+    def _fused_norm_gemv_enabled(self, device: Optional[torch.device] = None) -> bool:
+        """Whether this method may fold a gated RMSNorm into its MXFP8 GEMV.
+
+        The method-wide half of the gate: the opt-in flag, an MXFP8 checkpoint
+        on an SM120 CUDA part, and the dense backend that leaves ``weight``
+        row-major e4m3 [N, K] with the canonical UE8M0 bytes in
+        ``weight_scale_inv`` (the CUTLASS / CuTe-DSL backends keep their
+        swizzled copy separately in ``weight_scale_inv_swizzled``).
+        """
+        if not (self.use_mxfp8 and _is_cuda and not self.use_marlin):
+            return False
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_NORM_INTO_GEMV.get():
+            return False
+        from sglang.srt.layers.quantization import mxfp8_norm_gated_gemv as fused
+
+        if not fused.is_sm120():
+            return False
+        backend = self.mxfp8_dense_backend
+        return bool(
+            backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def apply_norm_gated(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        norm_weight: torch.Tensor,
+        group_size: int,
+        eps: float,
+        activation: str = "swish",
+    ) -> Optional[torch.Tensor]:
+        """``RMSNormGated(x, z)`` fed straight into this layer's MXFP8 GEMV.
+
+        The GDN block calls this where it would otherwise launch the norm
+        kernel and then :meth:`apply`. None means "do that instead", and it is
+        what every unsupported case returns: shape, dtype, weight layout,
+        backend, device, batch width, a batch-invariant run, or a capture that
+        has no scratch yet.
+        """
+        if not self._fused_norm_gemv_enabled(
+            getattr(getattr(layer, "weight", None), "device", None)
+        ):
+            return None
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return None
+        if batch_invariant_or_deterministic():
+            # The split-K reduction order is not cuBLAS's; a run that promises
+            # bit-stable logits keeps the unfused pair.
+            return None
+        weight = getattr(layer, "weight", None)
+        scale = getattr(layer, "weight_scale_inv", None)
+        if weight is None or scale is None or getattr(layer, "dequantized_bf16", False):
+            return None
+        from sglang.srt.layers.quantization import mxfp8_norm_gated_gemv as fused
+
+        if not fused.fused_norm_gemv_applies(
+            x, z, norm_weight, weight, scale, group_size, activation
+        ):
+            return None
+        return fused.fused_norm_gated_gemv(
+            x, z, norm_weight, weight, scale, group_size, eps, activation
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,

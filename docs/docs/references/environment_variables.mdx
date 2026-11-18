@@ -1772,6 +1772,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NORM_INTO_GEMV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fold the GDN gated RMSNorm (<code>RMSNormGated</code> over <code>head_v_dim</code>, norm-before-gate) into the A-load of the MXFP8 out_proj GEMV (<code>layers/quantization/mxfp8_norm_gated_gemv.py</code>), removing one kernel launch per GDN layer per decode step. Measured shapes only, SM120, MXFP8 dense weights, tensor parallelism 1, and not under batch-invariant or deterministic mode. Donor measurement: -0.95 us per call over 36 layers = -36 us per step.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the KDA output gated RMSNorm with per-token-group FP8 quantization for small-M target-verify batches feeding a blockwise-FP8 output projection. Takes effect only on SM90 with <code>SGLANG_ENABLE_FP8_BLOCK_GEMV=1</code>; otherwise it stays off.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
