@@ -167,6 +167,163 @@ class TestQSANVFP4Gathers(CustomTestCase):
             )
 
 
+class TestQSANVFP4FP8Scratch(CustomTestCase):
+    """FP8 gather scratch: the kernels receive ``g / descale`` (= 1/E2M1_MAX)
+    and write ``value / descale`` into E4M3; consumers multiply the descale
+    back. Pinned property: the descaled scratch stays within one E4M3 ulp of
+    the true dequant, extreme block scales land exactly on +/-448 (no overflow),
+    and zero block scales stay exactly zero.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.layers.attention.qsa.nvfp4_kv import reference_dequant
+
+        cls.slots = 160
+        cls.g = torch.tensor([0.75], device=DEVICE) if DEVICE else None
+        if DEVICE is None:
+            raise unittest.SkipTest("needs CUDA or TRITON_INTERPRET=1")
+        k, ks = quantize_nvfp4(make_kv(cls.slots, 11), 0.75)
+        v, vs = quantize_nvfp4(make_kv(cls.slots, 12), 0.75)
+        cls.k, cls.k_sf = k.to(DEVICE), ks.to(DEVICE)
+        cls.v, cls.v_sf = v.to(DEVICE), vs.to(DEVICE)
+        cls.ref = reference_dequant(cls.k, cls.k_sf, cls.g)
+
+    def _cases(self):
+        cases = {
+            "random": (self.k.clone(), self.k_sf.clone()),
+            # 448 (0x7E) x +/-6: stored = 448*6/6 must land exactly on +/-448.
+            "max-sf": (torch.full_like(self.k, 0x7F), torch.full_like(self.k_sf, 0x7E)),
+            "zero-sf": (self.k.clone(), torch.zeros_like(self.k_sf)),
+            # Smallest E4M3 denormal scale (0x01 = 2^-9) with +/-0.5 codes.
+            "subnormal": (
+                torch.full_like(self.k, 0x01 | 0x09),
+                torch.where(
+                    torch.arange(self.k_sf.numel(), device=DEVICE)
+                    % self.k_sf.shape[2]
+                    == 0,
+                    torch.tensor(1, dtype=torch.uint8, device=DEVICE),
+                    torch.tensor(0, dtype=torch.uint8, device=DEVICE),
+                )
+                .view_as(self.k_sf)
+                .contiguous(),
+            ),
+            "mixed-sign": (
+                torch.full_like(self.k, 0x07 | (0x08 << 4)),
+                self.k_sf.clone(),
+            ),
+        }
+        return cases
+
+    def _fp8_gather(self, data, sf):
+        from sglang.srt.layers.attention.qsa.nvfp4_kv import (
+            nvfp4_fp8_descale,
+            nvfp4_fp8_gather_scale,
+            nvfp4_gather_dequant,
+            reference_dequant,
+        )
+
+        m = data.shape[0]
+        index = torch.arange(m, device=DEVICE)
+        got = nvfp4_gather_dequant(
+            data,
+            sf,
+            nvfp4_fp8_gather_scale(self.g),
+            index,
+            torch.float8_e4m3fn,
+        )
+        descale = nvfp4_fp8_descale(self.g)
+        true = reference_dequant(data, sf, self.g)
+        return got, descale, true
+
+    def test_fp8_roundtrip_error_table(self):
+        rows = []
+        for name, (data, sf) in self._cases().items():
+            with self.subTest(case=name):
+                got, descale, true = self._fp8_gather(data, sf)
+                self.assertTrue(torch.isfinite(got.float()).all())
+                back = got.float() * descale
+                err = (back - true).abs()
+                # One E4M3 ulp in the normal range, plus the smallest subnormal
+                # step as headroom (the interpret-mode cast flushes stored values
+                # below it to zero; the hardware cvt may round either way).
+                bound = true.abs() * 2**-3 + (descale.abs() * 2**-8)
+                self.assertTrue(
+                    bool((err <= bound).all()),
+                    f"{name}: max err {err.max().item()} exceeds one-e4m3-ulp bound",
+                )
+                nz = true.abs() > 0
+                rel = (err[nz] / true.abs()[nz]).max().item() if bool(nz.any()) else 0.0
+                rows.append(
+                    (name, err.max().item(), rel, int((got.float() == 0).sum()))
+                )
+                if name == "max-sf":
+                    self.assertTrue(
+                        bool((got.float().abs() == 448.0).all()),
+                        "saturated values escaped the descale recipe",
+                    )
+                if name == "zero-sf":
+                    self.assertTrue(bool((got.float() == 0).all()))
+        table = "\nFP8 scratch error table (case, max_abs, max_rel, zero_rows):\n"
+        self.maxDiff = None
+        print(table + "\n".join(f"  {r[0]:>10}  {r[1]:.3e}  {r[2]:.3e}  {r[3]}" for r in rows))
+
+    def test_fp8_compact_and_prefill_descale_roundtrip(self):
+        from sglang.srt.layers.attention.qsa.nvfp4_kv import (
+            nvfp4_fp8_descale,
+            nvfp4_fp8_gather_scale,
+            pack_qsa_prefill_kv_nvfp4,
+            qwen_sparse_kv_extraction_compact_nvfp4_triton,
+            reference_dequant,
+        )
+        from sglang.srt.layers.attention.qsa.sparse_attn import (
+            qwen_sparse_valid_counts_triton,
+        )
+
+        scale = nvfp4_fp8_gather_scale(self.g)
+        descale = nvfp4_fp8_descale(self.g)
+        batch, topk, stride = 2, 40, 64
+        req_to_token = torch.stack(
+            [torch.randperm(self.slots, device=DEVICE)[:80] for _ in range(3)]
+        ).to(torch.int32)
+        req_indices = torch.tensor([1, 2], dtype=torch.int32, device=DEVICE)
+        seq_lens = torch.tensor([80, 45], dtype=torch.int32, device=DEVICE)
+        indices = torch.full((batch, topk), -1, dtype=torch.int32, device=DEVICE)
+        indices[0, :40] = torch.arange(40, dtype=torch.int32)
+        indices[1, :30] = torch.arange(30, dtype=torch.int32)
+        counts = torch.empty(batch, dtype=torch.int32, device=DEVICE)
+        qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk)
+        cu_k = torch.arange(batch + 1, dtype=torch.int32, device=DEVICE) * stride
+        out_k = torch.zeros(batch * stride, HEADS, DIM, dtype=torch.float8_e4m3fn, device=DEVICE)
+        out_v = torch.zeros_like(out_k)
+        qwen_sparse_kv_extraction_compact_nvfp4_triton(
+            self.k, self.v, self.k_sf, self.v_sf, scale, scale,
+            req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v,
+            batch, topk, zero_fill_cols=stride,
+        )
+        for b in range(batch):
+            n, start = int(counts[b]), b * stride
+            slots = req_to_token[int(req_indices[b]), indices[b, :n].long()].long()
+            true = reference_dequant(self.k, self.k_sf, self.g)[slots]
+            err = (out_k[start : start + n].float() * descale - true).abs()
+            self.assertTrue(
+                bool((err <= true.abs() * 2**-3 + descale * 2**-8).all())
+            )
+            self.assertTrue(bool((out_k[start + n : start + stride].float() == 0).all()))
+        pk, pv = pack_qsa_prefill_kv_nvfp4(
+            k=self.k, v=self.v, k_sf=self.k_sf, v_sf=self.v_sf,
+            k_g=scale, v_g=scale, req_to_token=req_to_token,
+            req_indices=req_indices, seq_lens=seq_lens,
+            cu_k=torch.nn.functional.pad(seq_lens, (1, 0)).to(torch.int32),
+            total_k=125, output_dtype=torch.float8_e4m3fn,
+        )
+        slots = torch.cat([req_to_token[1, :80], req_to_token[2, :45]]).long()
+        true = reference_dequant(self.k, self.k_sf, self.g)[slots]
+        err = (pk.float() * descale - true).abs()
+        self.assertEqual(int(pk.shape[0]), 125)
+        self.assertTrue(bool((err <= true.abs() * 2**-3 + descale * 2**-8).all()))
+
+
 class TestQSANVFP4Recipe(CustomTestCase):
     def _method(self, num_layers=12):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
