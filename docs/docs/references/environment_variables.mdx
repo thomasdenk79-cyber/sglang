@@ -1777,6 +1777,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MTP_FC_GEMV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run the MTP entry projections (<code>fc_embedding</code>, <code>fc_hidden</code>) through the SM120 BF16 skinny GEMV at 1..16 rows. Switches the in-tree kernel for the MTP entry on by itself, without <code>SGLANG_SM120_BF16_SKINNY_GEMV</code>'s router-gate and <code>in_proj_ba</code> routes. Not bit-identical: the split-K order differs from cuBLAS. Donor measurement: 12.5 us for the cuBLAS pair per projection, saved 1.5..1.9 us per forward by the GEMV.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the KDA output gated RMSNorm with per-token-group FP8 quantization for small-M target-verify batches feeding a blockwise-FP8 output projection. Takes effect only on SM90 with <code>SGLANG_ENABLE_FP8_BLOCK_GEMV=1</code>; otherwise it stays off.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

@@ -1498,6 +1498,11 @@ class Envs:
     # (layers/quantization/mxfp8_norm_gated_gemv.py). Measured shapes only;
     # every other call keeps the separate norm kernel.
     SGLANG_NORM_INTO_GEMV = EnvBool(False)
+    # Opt-in: the MTP entry projections (fc_embedding, fc_hidden) run the
+    # split-K Triton skinny GEMV at 1..16 rows instead of cuBLAS. The kernel is
+    # the in-tree one the MoE router gate uses; this flag turns the MTP entry
+    # on by itself, without the router or the GDN in_proj_ba route.
+    SGLANG_MTP_FC_GEMV = EnvBool(False)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS

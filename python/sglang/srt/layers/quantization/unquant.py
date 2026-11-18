@@ -128,12 +128,12 @@ def _use_sm120_bf16_skinny_gemv() -> bool:
     return _is_cuda and envs.SGLANG_SM120_BF16_SKINNY_GEMV.get() and is_sm120()
 
 
-def maybe_sm120_bf16_skinny_linear(
-    x: torch.Tensor, weight: torch.Tensor
+def _bf16_skinny_linear_if(
+    x: torch.Tensor, weight: torch.Tensor, enabled: bool
 ) -> Optional[torch.Tensor]:
-    """``F.linear(x, weight)`` via the sm_120 skinny GEMV, or None if it does not apply."""
+    """The gated half of both hooks: ``enabled`` is the caller's flag verdict."""
     if (
-        not _use_sm120_bf16_skinny_gemv()
+        not enabled
         or torch.compiler.is_compiling()
         # The split-K order depends on the batch size.
         or is_batch_invariant_mode_enabled()
@@ -141,6 +141,37 @@ def maybe_sm120_bf16_skinny_linear(
     ):
         return None
     return bf16_skinny_linear(x, weight)
+
+
+def maybe_sm120_bf16_skinny_linear(
+    x: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``F.linear(x, weight)`` via the sm_120 skinny GEMV, or None if it does not apply."""
+    return _bf16_skinny_linear_if(x, weight, _use_sm120_bf16_skinny_gemv())
+
+
+@functools.cache
+def _use_mtp_fc_gemv() -> bool:
+    """Whether the MTP entry projections may use the skinny GEMV.
+
+    The donor gates them behind SGLANG_MTP_FC_GEMV and the other skinny
+    linears behind SGLANG_SM120_BF16_SKINNY_GEMV; keeping the two apart lets
+    an A/B move the MTP entry without dragging the router gate along.
+    """
+    return _is_cuda and envs.SGLANG_MTP_FC_GEMV.get() and is_sm120()
+
+
+def maybe_mtp_fc_skinny_linear(
+    x: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``F.linear(x, weight)`` for the MTP entry fc, or None to keep cuBLAS.
+
+    Either flag routes it: the one of its own, or the general skinny-GEMV one
+    that already covers this shape.
+    """
+    return _bf16_skinny_linear_if(
+        x, weight, _use_mtp_fc_gemv() or _use_sm120_bf16_skinny_gemv()
+    )
 
 
 if _rowmajor_ok:

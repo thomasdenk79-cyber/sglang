@@ -14,7 +14,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import maybe_sm120_bf16_skinny_linear
+from sglang.srt.layers.quantization.unquant import maybe_mtp_fc_skinny_linear
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -37,8 +37,44 @@ logger = logging.getLogger(__name__)
 
 
 def _fc(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    """The MTP fc_embedding/fc_hidden projection (bias-free BF16 nn.Linear)."""
-    out = maybe_sm120_bf16_skinny_linear(x, linear.weight)
+    """The MTP fc_embedding/fc_hidden projection (bias-free BF16 nn.Linear).
+
+    At decode widths cuBLAS picks a poor kernel for a [<=16, 2560] x [2560,
+    2560] BF16 GEMM, so the entry runs the split-K Triton skinny GEMV instead
+    (SGLANG_MTP_FC_GEMV, or the general SGLANG_SM120_BF16_SKINNY_GEMV). The
+    GEMV has no bias term, so a biased fc always keeps ``linear``.
+
+    **Flag**: ``SGLANG_MTP_FC_GEMV=1``, default 0. It is the donor's switch of
+    the same name; the kernel is this tree's
+    ``kernels/ops/gemm/sm120_bf16_skinny_gemv.py`` (already tuned for
+    ``(2560, 2560)``) rather than the donor's per-channel FP8 ``w8a16_gemv``,
+    because both fc weights are BF16 in this checkpoint -- they sit in the
+    quantization config's ignore list. sm_120 only, and a batch-invariant or
+    torch.compile run keeps cuBLAS.
+
+    **Gain**: the donor measured 12.5 us for the cuBLAS GEMM plus splitKreduce
+    of one entry projection against a skinny-GEMV saving of 1.52 us per
+    forward at 1 row and 1.93 us at 4 rows behind an L2 flush (1.63..2.20 us
+    warm), i.e. an estimated -6.5..-14 us per draft step, and patched 0024
+    reports verify 15.8 -> 15.1 ms at W16 with 63 fewer kernels per step for
+    this and the router gate together. Two calls per verify step, not per
+    layer. The donor's separate FP8 entry-fc experiment
+    (docs/lab-notes/E0_MTP_FC_FP8.md) failed its gate and is not ported.
+
+    **VRAM**: 0 -- the kernel reads the stored weight and reuses per-stream
+    split-K scratch that is already allocated for the other skinny linears.
+
+    **Numerics**: not bit-identical. Same BF16 operands, fp32 accumulation and
+    bf16 output, but the split-K order is cuBLAS's, not this kernel's; the
+    donor saw 8e-5 of the elements differ, max abs 0.0625 (up to 64 ulp at 4
+    rows). Acceptable for an entry projection, but it is a change -- a
+    batch-invariant or deterministic run keeps cuBLAS.
+    """
+    out = (
+        None
+        if linear.bias is not None
+        else maybe_mtp_fc_skinny_linear(x, linear.weight)
+    )
     return linear(x) if out is None else out
 
 
