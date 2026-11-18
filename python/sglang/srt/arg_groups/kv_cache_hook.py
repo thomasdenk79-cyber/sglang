@@ -445,10 +445,14 @@ def _check_qsa_kv4_compatibility(cfg: Any) -> None:
             "block scales of the QSA pool. Disable them or use "
             "--kv-cache-dtype=fp8_e4m3."
         )
-    if envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get():
+    if (
+        envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
+        and envs.SGLANG_QSA_NVFP4_SCRATCH.get() != "fp8"
+    ):
         logger.warning(
             "SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA reads FP8/BF16 KV only; with "
-            "NVFP4 KV the QSA backend uses its dequantizing TRT-LLM decode path."
+            "NVFP4 KV and SGLANG_QSA_NVFP4_SCRATCH=bf16 the QSA backend uses "
+            "its dequantizing TRT-LLM decode path."
         )
 
 
