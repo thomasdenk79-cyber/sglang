@@ -343,6 +343,55 @@ def test_activation_width_mismatch_falls_back(monkeypatch):
     assert called.get("yes") is True
 
 
+def test_maybe_apply_refuses_a_1d_activation(monkeypatch):
+    # Round-3 finding: shape[0] == 1 alone is not a one-token call. A [1]
+    # activation has no width, and the guards that run after
+    # _is_one_token_call index shape[1], so maybe_apply raised IndexError
+    # instead of falling through to CUTLASS. Anything the predicate cannot
+    # describe must return None.
+    runner = dmg.DraftMoeGemvRunner()
+    called = {}
+
+    def fake_gemv(**kw):
+        called["yes"] = True
+        return torch.zeros(1, H, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(dmg, "draft_moe_gemv", fake_gemv)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    layer = SimpleNamespace(
+        **_meta_layer_tensors(),
+        w13_weight_scale_2=torch.ones(8, 2, device="meta"),
+        w2_weight_scale_2=torch.ones(8, device="meta"),
+        layer_id=7,
+    )
+
+    def refused(dispatch_output, why):
+        assert runner.maybe_apply(layer=layer, dispatch_output=dispatch_output) is (
+            None
+        ), why
+
+    # A bare [1] activation: shape[0] == 1, no shape[1].
+    refused(_dispatch(x=torch.zeros(1, dtype=torch.bfloat16)), "1-D activation")
+    # A batch of one token in three ranks is still not [1, H].
+    refused(_dispatch(x=torch.zeros(1, 1, H, dtype=torch.bfloat16)), "3-D activation")
+    # A flat route row: _get_workspace reads topk_ids.shape[1].
+    refused(
+        _dispatch(ids=torch.zeros(10, dtype=torch.int64), wts=torch.ones(10)),
+        "1-D topk_ids",
+    )
+    # k2 indexes topk_weights with the route id of topk_ids, so a narrower
+    # weight row would read past its storage.
+    refused(
+        _dispatch(ids=torch.zeros(1, 10, dtype=torch.int64), wts=torch.ones(1, 4)),
+        "topk_weights narrower than topk_ids",
+    )
+    assert not called, "a refused call must not reach the kernels"
+    assert runner._workspace is None, "a refused call must not size the scratch"
+    # Positive control: the ordinary one-token call still takes the fast path.
+    assert runner.maybe_apply(layer=layer, dispatch_output=_dispatch()) is not None
+    assert called.get("yes") is True
+
+
 def test_runner_workspace_and_plumbing(monkeypatch):
     runner = dmg.DraftMoeGemvRunner()
     sentry = torch.zeros(1, H, dtype=torch.bfloat16)

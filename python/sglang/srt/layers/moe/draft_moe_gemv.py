@@ -390,18 +390,29 @@ def draft_moe_gemv(
 def _is_one_token_call(dispatch_output: StandardDispatchOutput) -> bool:
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
     return (
-        x.shape[0] == 1
+        # k1 reads x as [1, H] and both kernels index the routes as [1, R]; a
+        # tensor of any other rank is not this path, and the guards after this
+        # predicate index shape[1] (a bare [1] activation used to raise
+        # IndexError instead of falling through to CUTLASS).
+        x.dim() == 2
+        and x.shape[0] == 1
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
         and dispatch_output.hidden_states_scale is None
-        and topk_output.topk_ids.is_contiguous()
-        and topk_output.topk_weights.is_contiguous()
+        and topk_ids.dim() == 2
+        and topk_weights.dim() == 2
+        # k2 walks ids flat and multiplies by w[r] with the same r, so a
+        # narrower weights row would read past its storage.
+        and topk_weights.shape == topk_ids.shape
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
         # A triton launch disconnects autograd silently; mirror the router
         # gate's convention and only take the shortcut outside grad mode.
         and not (
-            torch.is_grad_enabled()
-            and (x.requires_grad or topk_output.topk_weights.requires_grad)
+            torch.is_grad_enabled() and (x.requires_grad or topk_weights.requires_grad)
         )
     )
 
