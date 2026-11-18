@@ -1875,6 +1875,18 @@ macro_rules! tree_core_methods {
                 .map(BufferBackupStateBinding::from)
             }
 
+            /// Split a node into page-aligned backup pieces; see the core method.
+            fn split_for_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                piece_tokens: usize,
+            ) -> PyResult<(Vec<NodeId>, Py<PyList>)> {
+                let (piece_ids, actions) =
+                    py.detach(|| self.core().split_for_backup(node_id, piece_tokens));
+                Ok((piece_ids, cache_actions_to_py(py, actions)?))
+            }
+
             /// Hash every node built while storage was disabled.
             fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
                 py.detach(|| self.core().backfill_missing_hash_values())
@@ -3329,6 +3341,16 @@ macro_rules! tree_core_binding {
                         .inner
                         .validate_buffer_backup(py, node_id, expected_key_length))
                 })
+            }
+
+            /// Split a node into page-aligned backup pieces; see the core method.
+            fn split_for_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                piece_tokens: usize,
+            ) -> PyResult<(Vec<NodeId>, Py<PyList>)> {
+                catch_native_panic(|| self.inner.split_for_backup(py, node_id, piece_tokens))
             }
 
             /// Hash every node built while storage was disabled.

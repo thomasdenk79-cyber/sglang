@@ -1245,6 +1245,92 @@ fn split_wires_the_new_node_between_parent_and_child() {
 }
 
 #[test]
+fn split_span_is_page_aligned_with_the_tail_last() {
+    assert_eq!(super::split_span(40, 16, 4), vec![16, 16, 8]);
+    assert_eq!(super::split_span(10, 7, 4), vec![4, 4, 2]);
+    assert_eq!(super::split_span(10, 2, 4), vec![4, 4, 2]);
+    assert_eq!(super::split_span(8, 16, 4), vec![8]);
+    assert!(super::split_span(0, 16, 4).is_empty());
+}
+
+#[test]
+fn split_for_backup_keeps_the_tail_id_and_hash_chain() {
+    let mut tc = core();
+    let root = tc.arena.root();
+    let leaf = add_leaf(&mut tc, root, (1..=10).collect::<Vec<i64>>());
+    let hashes: Vec<String> = (0..10).map(|i| format!("h{i}")).collect();
+    tc.arena.node_mut(leaf).hash_value = Some(hashes.clone());
+    tc.arena
+        .node_mut(leaf)
+        .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
+    let leaf_id = tc.arena.node(leaf).id;
+
+    let (pieces, actions) = tc.split_for_backup(leaf_id, 4);
+    assert!(actions.is_empty());
+    assert_eq!(pieces.len(), 3);
+    assert_eq!(pieces[2], leaf_id);
+    let idx: Vec<NodeIdx_> = pieces
+        .iter()
+        .map(|&id| tc.arena.resolve(id).expect("live piece"))
+        .collect();
+    assert_eq!(idx[2], leaf);
+    let lens: Vec<usize> = idx
+        .iter()
+        .map(|&n| tc.arena.node(n).key.atom_len())
+        .collect();
+    assert_eq!(lens, vec![4, 4, 2]);
+    assert_eq!(tc.arena.node(idx[0]).parent(), root);
+    assert_eq!(tc.arena.node(idx[1]).parent(), idx[0]);
+    assert_eq!(tc.arena.node(idx[2]).parent(), idx[1]);
+    let chain: Vec<String> = idx
+        .iter()
+        .flat_map(|&n| tc.arena.node(n).hash_value.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(chain, hashes);
+    for &n in &idx {
+        assert_eq!(tc.arena.device_lock_ref(n, FULL), 1);
+        assert_eq!(
+            tc.arena.device_value_len(n, FULL),
+            tc.arena.node(n).key.atom_len()
+        );
+    }
+
+    // A node within budget stays whole; the root yields nothing.
+    let (pieces, actions) = tc.split_for_backup(leaf_id, 4);
+    assert_eq!((pieces, actions.len()), (vec![leaf_id], 0));
+    let root_id = tc.arena.node(root).id;
+    let (pieces, actions) = tc.split_for_backup(root_id, 4);
+    assert_eq!((pieces.len(), actions.len()), (0, 0));
+}
+
+#[test]
+fn split_for_backup_reports_buffer_only_splits() {
+    let mut tc = core();
+    tc.is_host_memory_buffer_only = true;
+    let root = tc.arena.root();
+    let leaf = add_leaf(&mut tc, root, (1..=6).collect::<Vec<i64>>());
+    let leaf_id = tc.arena.node(leaf).id;
+    let (pieces, actions) = tc.split_for_backup(leaf_id, 2);
+    assert_eq!(pieces.len(), 3);
+    assert_eq!(
+        action_kinds(&actions),
+        vec!["update_pending_backup_on_node_split"; 2]
+    );
+    for (action, head) in actions.iter().zip(&pieces) {
+        let split = expect_action::<UpdatePendingBackupOnNodeSplit>(action.as_ref());
+        assert_eq!(
+            (
+                split.ack_id,
+                split.old_node_id,
+                split.new_node_id,
+                split.new_child_node_id
+            ),
+            (None, leaf_id, *head, leaf_id)
+        );
+    }
+}
+
+#[test]
 fn split_redistributes_the_device_value_and_locks() {
     let mut tc = core();
     let c = split_setup(&mut tc);
