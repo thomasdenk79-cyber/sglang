@@ -334,6 +334,8 @@ By employing a truncated high-frequency token vocabulary in the draft model, EAG
 
 In our implementation, set `--speculative-token-map` to enable the optimization. You can get the high-frequency tokens in FR-Spec from [this model](https://huggingface.co/thunlp/LLaMA3-Instruct-8B-FR-Spec). Or you can obtain high-frequency tokens by directly downloading these tokens from [this repo](https://github.com/thunlp/FR-Spec/tree/main?tab=readme-ov-file#prepare-fr-spec-vocabulary-subset).
 
+With `SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS > 0` the draft head additionally learns workload tokens at runtime (FIFO, LRU, LFU or tiered policies, optional adaptive static map and persistence); see `python/sglang/srt/speculative/dynamic_draft_vocab.md`.
+
 Thanks for the contribution from [Weilin Zhao](https://github.com/Achazwl) and [Zhousx](https://github.com/Zhou-sx).
 
 ```bash Command
