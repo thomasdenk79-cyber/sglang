@@ -304,6 +304,45 @@ def test_maybe_apply_falls_back():
     assert runner.maybe_apply(layer=None, dispatch_output=_dispatch(x=t)) is None
 
 
+def test_activation_width_mismatch_falls_back(monkeypatch):
+    # k1 reads x as [1, H] with H from w13_weight; a narrower activation
+    # would read past its storage. The dispatcher owns both operands, but a
+    # reused runner must refuse the mismatch instead of launching an OOB read.
+    runner = dmg.DraftMoeGemvRunner()
+    called = {}
+
+    def fake_gemv(**kw):
+        called["yes"] = True
+        return torch.zeros(1, H, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(dmg, "draft_moe_gemv", fake_gemv)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(
+            (E_FULL, 2 * I, H // 2), dtype=torch.uint8, device="meta"
+        ),
+        w13_blockscale_swizzled=torch.empty(
+            (E_FULL, 2 * I, H // 16), dtype=torch.uint8, device="meta"
+        ),
+        w13_weight_scale_2=torch.ones(E_FULL, 2, device="meta"),
+        w2_weight=torch.empty((E_FULL, H, I // 2), dtype=torch.uint8, device="meta"),
+        w2_blockscale_swizzled=torch.empty(
+            (E_FULL, H, I // 16), dtype=torch.uint8, device="meta"
+        ),
+        w2_weight_scale_2=torch.ones(E_FULL, device="meta"),
+        layer_id=7,
+    )
+    narrow = _dispatch(x=torch.zeros(1, H // 2, dtype=torch.bfloat16))
+    assert runner.maybe_apply(layer=layer, dispatch_output=narrow) is None, (
+        "an activation narrower than the layer hidden size must keep CUTLASS"
+    )
+    assert not called, "the refused call must not reach the kernels"
+    assert runner._workspace is None, "the refused call must not size the scratch"
+    # Positive control: the matching width still takes the fast path.
+    assert runner.maybe_apply(layer=layer, dispatch_output=_dispatch()) is not None
+    assert called.get("yes") is True
+
+
 def test_runner_workspace_and_plumbing(monkeypatch):
     runner = dmg.DraftMoeGemvRunner()
     sentry = torch.zeros(1, H, dtype=torch.bfloat16)

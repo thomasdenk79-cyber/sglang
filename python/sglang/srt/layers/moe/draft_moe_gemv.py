@@ -414,6 +414,7 @@ class DraftMoeGemvRunner:
         self._workspace: DraftMoeWorkspace | None = None
         self._warned_capture = False
         self._warned_routes = False
+        self._warned_width = False
 
     def maybe_apply(
         self, *, layer: FusedMoE, dispatch_output: DispatchOutput
@@ -422,6 +423,21 @@ class DraftMoeGemvRunner:
         if not isinstance(dispatch_output, StandardDispatchOutput):
             return None
         if not _is_one_token_call(dispatch_output):
+            return None
+        # k1 reads x as [1, H] with H taken from w13_weight; a narrower
+        # activation would read past its storage. The dispatcher owns both
+        # operands and cannot produce the mismatch, but a runner reused
+        # outside maybe_apply must not turn one into an OOB read.
+        if dispatch_output.hidden_states.shape[1] != layer.w13_weight.shape[2] * 2:
+            if not self._warned_width:
+                logger.warning(
+                    "draft MoE GEMV: activation width %d does not match the "
+                    "hidden size %d of layer %d; such calls keep CUTLASS",
+                    dispatch_output.hidden_states.shape[1],
+                    layer.w13_weight.shape[2] * 2,
+                    layer.layer_id,
+                )
+                self._warned_width = True
             return None
         workspace = self._get_workspace(layer=layer, dispatch_output=dispatch_output)
         if workspace is None:
