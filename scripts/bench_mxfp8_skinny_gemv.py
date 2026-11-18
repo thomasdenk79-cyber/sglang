@@ -16,6 +16,15 @@ regime the decode path actually runs in (no launch overhead, no allocator
 traffic); the plain event timing includes both. ``--check`` additionally
 compares the GEMV against a dequantized-weight fp32 reference for each shape.
 
+Every row says what *executed*, not what the gate would allow: the GEMV counts
+its own launches (``mxfp8_skinny_gemv.launch_count()``), the capture happens on
+a stream whose split-K scratch was materialized before the capture (a launch
+whose scratch is missing mid-capture falls back to the W8A8 GEMM, and a table
+row that quietly timed the fallback would be worse than no measurement), and a
+row that claims ``gemv`` without a single GEMV launch makes the exit code
+non-zero. ``gemv(fallback)`` in the route column means exactly that; the
+``plan=`` column shows the tile the row was supposed to run.
+
 Weight and scale bytes are this checkpoint's real MXFP8 layout, filled with
 deterministic random data (``--seed``), and both paths go through the same
 ``Fp8LinearMethod`` instance so the old path is exactly the production one,
@@ -27,6 +36,7 @@ from __future__ import annotations
 import argparse
 import sys
 from types import SimpleNamespace
+from typing import Optional, Tuple
 
 import torch
 
@@ -46,6 +56,7 @@ SHAPES = [
 ]
 
 GROUP_K = 32
+DEVICE = torch.device("cuda", 0)
 
 
 def _fill(n: int, k: int, seed: int):
@@ -92,21 +103,57 @@ def _method():
     return Fp8LinearMethod(config)
 
 
-def _time(fn, reps: int, warmup: int, graph: bool) -> float:
-    """Median microseconds per call; with ``graph``, inside a CUDA graph replay."""
+def _capture_stream() -> torch.cuda.Stream:
+    """The stream the decode runner captures on, or a fresh one.
+
+    Capturing where ``prealloc`` already put the split-K scratch is the point:
+    on any other stream the first split-K launch of a capture misses, falls back
+    to the W8A8 GEMM and the graph silently replays the old path.
+    """
+    try:
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_or_create_global_graph_capture_stream,
+        )
+
+        stream = get_or_create_global_graph_capture_stream()
+    except Exception as e:  # a build without the shared capture stream
+        print(
+            f"  (no shared capture stream: {e}; using a private one)", file=sys.stderr
+        )
+        stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        from sglang.srt.layers.quantization import mxfp8_skinny_gemv as gemv
+
+        gemv.prealloc(DEVICE, stream)
+    return stream
+
+
+def _time(
+    fn, reps: int, warmup: int, graph: bool, capture_stream: Optional[torch.cuda.Stream]
+) -> Tuple[float, int]:
+    """(median microseconds per call, GEMV launches the timed section recorded).
+
+    In graph mode the launch count is taken across the capture, so it says what
+    ended up in the graph rather than what the gate would have allowed.
+    """
     import statistics
+
+    from sglang.srt.layers.quantization import mxfp8_skinny_gemv as gemv
 
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     if graph:
+        stream = capture_stream or torch.cuda.Stream()
         try:
-            capture = torch.cuda.CUDAGraph()
-            stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
+                gemv.prealloc(DEVICE, stream)
+                before = gemv.launch_count()
+                capture = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(capture, stream=stream):
                     for _ in range(reps):
                         fn()
+                captured = gemv.launch_count() - before
             torch.cuda.synchronize()
             times = []
             for _ in range(5):
@@ -117,9 +164,10 @@ def _time(fn, reps: int, warmup: int, graph: bool) -> float:
                 end.record()
                 torch.cuda.synchronize()
                 times.append(start.elapsed_time(end) * 1e3 / reps)
-            return statistics.median(times)
+            return statistics.median(times), captured
         except Exception as e:  # a backend that cannot be captured here
             print(f"  (graph capture failed: {e}; timing eager)", file=sys.stderr)
+    before = gemv.launch_count()
     times = []
     for _ in range(reps):
         start = torch.cuda.Event(True)
@@ -129,7 +177,18 @@ def _time(fn, reps: int, warmup: int, graph: bool) -> float:
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end) * 1e3)
-    return statistics.median(times)
+    return statistics.median(times), gemv.launch_count() - before
+
+
+def _plan_note(m: int, n: int, k: int, sms: int) -> str:
+    """The tile this row runs, marked if the tuned table entry was overridden."""
+    from sglang.srt.layers.quantization import mxfp8_skinny_gemv as gemv
+
+    plan = gemv._plan(m, n, k, sms)
+    bucket = gemv._m_bucket(m)
+    table = gemv._TUNED.get((bucket, n, k))
+    demoted = table is not None and table[2] != plan[2]
+    return f"  plan={plan}{' (table splits demoted)' if demoted else ''}"
 
 
 def main() -> int:
@@ -165,6 +224,12 @@ def main() -> int:
     method = _method()
     envs.SGLANG_MXFP8_SKINNY_GEMV_MAX_M.set(max(ms))
     sms = torch.cuda.get_device_properties(0).multi_processor_count
+    # The gate has to be open while the weights are processed: that is where
+    # prealloc() materializes the split-K scratch of the forward, capture and alt
+    # streams. The rows below then only have to bring their own capture stream.
+    with envs.SGLANG_MXFP8_SKINNY_GEMV.override(True):
+        gemv.prealloc(DEVICE)
+    capture_stream = _capture_stream() if args.graph else None
     print(
         f"device={torch.cuda.get_device_name()} sm_{cap[0]}{cap[1]} "
         f"backend={method.mxfp8_dense_backend} sms={sms} "
@@ -172,36 +237,59 @@ def main() -> int:
     )
     header = (
         f"{'shape':<22} {'N':>7} {'K':>6} {'M':>3} {'old us':>9} {'new us':>9} "
-        f"{'speedup':>8} {'new GB/s':>9} {'max rel':>9}"
+        f"{'speedup':>8} {'new GB/s':>9} {'max rel':>9} {'route':>14}"
     )
     print(header)
     print("-" * len(header))
 
+    bad = []
     for name, n, k in rows:
         layer = _layer(n, k, args.seed)
-        method.process_weights_after_loading(layer)
-        gemv_able = gemv.mxfp8_skinny_gemv_applies(
-            torch.zeros(1, k, dtype=torch.bfloat16, device="cuda"),
-            layer.weight,
-            layer.weight_scale_inv,
-        )
+        with envs.SGLANG_MXFP8_SKINNY_GEMV.override(True):
+            # Runs prealloc() for this layer's device (mxfp8_skinny_gemv
+            # ._mxfp8_skinny_gemv_enabled is only true with the flag on).
+            method.process_weights_after_loading(layer)
         for m in ms:
             x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+            # The gate as apply() sees it, at this exact width: above
+            # MAX_TUNED_M it refuses, and that row is w8a8, not a failure.
+            gemv_able = gemv.mxfp8_skinny_gemv_applies(
+                x, layer.weight, layer.weight_scale_inv
+            )
             with envs.SGLANG_MXFP8_SKINNY_GEMV.override(False):
-                old = _time(
+                old, old_launches = _time(
                     lambda layer=layer, x=x: method.apply(layer, x),
                     args.reps,
                     args.warmup,
                     args.graph,
+                    capture_stream,
                 )
             with envs.SGLANG_MXFP8_SKINNY_GEMV.override(True):
-                new = _time(
+                new, new_launches = _time(
                     lambda layer=layer, x=x: method.apply(layer, x),
                     args.reps,
                     args.warmup,
                     args.graph,
+                    capture_stream,
                 )
-            gbps = n * k / (new * 1e-6) / 1e9 if new > 0 else 0.0
+            # What ran, from the kernel's own counter -- not from the predicate.
+            if new_launches > 0 and old_launches > 0:
+                bad.append((name, m, "the W8A8 column launched the GEMV"))
+            route = "w8a8"
+            if gemv_able:
+                route = f"gemv({new_launches})" if new_launches else "gemv(fallback)"
+            elif new_launches:
+                bad.append((name, m, "the gate refused it but the GEMV ran"))
+            if gemv_able and not new_launches:
+                bad.append(
+                    (
+                        name,
+                        m,
+                        "no GEMV launch: this row timed the W8A8 fallback "
+                        "(prealloc did not cover the capture stream)",
+                    )
+                )
+            gbps = n * k / (new * 1e-6) / 1e9 if new > 0 and new_launches else 0.0
             rel = float("nan")
             if args.check and gemv_able:
                 ref = gemv.mxfp8_skinny_gemv_reference(
@@ -210,23 +298,29 @@ def main() -> int:
                 with envs.SGLANG_MXFP8_SKINNY_GEMV.override(True):
                     got = method.apply(layer, x).float()
                 rel = ((got - ref).abs() / ref.abs().clamp(min=1e-3)).max().item()
-            plan = (
-                f"  plan={gemv._plan(m, n, k, sms)}" if args.plan and gemv_able else ""
-            )
+                if not gemv.counters_are_zero(DEVICE):
+                    bad.append((name, m, "split-K counters were left non-zero"))
+            plan = _plan_note(m, n, k, sms) if args.plan and gemv_able else ""
+            speed = f"{old / new:>7.2f}x" if new_launches else f"{'n/a':>8}"
             print(
                 f"{name:<22} {n:>7} {k:>6} {m:>3} {old:>9.2f} {new:>9.2f} "
-                f"{old / new:>7.2f}x {gbps:>9.0f} {rel:>9.4f} "
-                f"[{'gemv' if gemv_able else 'w8a8'}]{plan}"
+                f"{speed} {gbps:>9.0f} {rel:>9.4f} {route:>14}{plan}"
             )
         del layer
         torch.cuda.empty_cache()
     print(
-        "\nroute=gemv: SGLANG_MXFP8_SKINNY_GEMV=1 routes this shape to the Triton GEMV;\n"
-        "route=w8a8: the gate refused it (too small, or dequantized to bf16 at load) and\n"
-        "both columns are the W8A8 GEMM.\n"
+        "\nroute=gemv(n): the GEMV kernel launched n times in the timed section (the "
+        "capture, in --graph mode);\nroute=gemv(fallback): the gate allowed it but no "
+        "launch reached the kernel, so both columns are the\n  W8A8 GEMM and the row is "
+        "not a measurement of the GEMV;\nroute=w8a8: the gate refused it (too small, or "
+        "dequantized to bf16 at load).\n"
+        "plan= is (BLOCK_N, BLOCK_K, SPLITS, USE_DOT, num_warps, num_stages); a table "
+        "entry _fit demoted to SPLITS=1 is marked, because such an entry never runs.\n"
         "Weight bytes read = N*K (fp8) + N*K/32 (UE8M0); GB/s is over N*K."
     )
-    return 0
+    for name, m, why in bad:
+        print(f"ERROR {name} M={m}: {why}", file=sys.stderr)
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
