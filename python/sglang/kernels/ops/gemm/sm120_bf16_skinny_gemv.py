@@ -496,6 +496,16 @@ def _launch(
     if norm is not None:
         z, nw, norm_g, norm_eps, norm_sigmoid = norm
     pdl = triton_pdl_enabled()
+    if pdl and norm is not None:
+        # The PDL build reads norm_w before pdl_wait, which is only safe for
+        # tensors no in-stream kernel writes; a norm weight produced upstream
+        # would be read one kernel too early. No caller passes norm= today,
+        # so fail loud instead of shipping that race to a future one.
+        raise RuntimeError(
+            "sm120_bf16_skinny_gemv: fused-norm launches require "
+            "SGLANG_TRITON_PDL off (the gate preloads the norm weight before "
+            "gdc_wait); unset the flag to use norm fusion"
+        )
     _w8a16_gemv_kernel[(n_blocks, splits)](
         x,
         w,
