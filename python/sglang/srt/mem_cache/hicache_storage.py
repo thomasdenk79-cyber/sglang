@@ -135,6 +135,10 @@ class PoolName(str, Enum):
     ERNIE5_5_MLA = "ernie55_mla"
     ERNIE5_5_MLA_INDEXER = "ernie55_mla_indexer"
 
+    # QSA NVFP4 KV: token-linear E4M3 block scales beside the packed FP4 KV.
+    KV_K_SCALE = "kv_k_scale"
+    KV_V_SCALE = "kv_v_scale"
+
     # Draft KV pool
     DRAFT = "draft"
     DRAFT_INDEXER = "draft_indexer"

@@ -309,9 +309,9 @@ class TestHostKVCache(CustomTestCase):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
             NVFP4KVCacheMethod,
-            QSANVFP4KVCacheMethod,
         )
 
+        # QSA NVFP4 scales travel as host sidecars: test_qsa_nvfp4_hicache.py.
         for pool_cls, method in (
             (MHATokenToKVPool, FP4MXBlock16KVCacheMethod()),
             (
@@ -319,11 +319,6 @@ class TestHostKVCache(CustomTestCase):
                 NVFP4KVCacheMethod(
                     num_layers=1, device="cpu", native_scale_layout=False
                 ),
-            ),
-            # QSA NVFP4 HiCache is fail-closed: block scales have no host copy.
-            (
-                MHATokenToKVPool,
-                QSANVFP4KVCacheMethod(num_layers=1, device="cpu", page_size=16),
             ),
             (MHATokenToKVPoolFP4, None),
         ):

@@ -69,6 +69,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k, maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    QSANVFP4KVCacheMethod,
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -2418,6 +2419,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
+        if self._has_qsa_nvfp4_scales():
+            return self._qsa_nvfp4_device_pool_infos()
         return (
             DevicePoolInfo(
                 pool_name=PoolName.KV,
@@ -2425,6 +2428,69 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 layer_ids=self.model_layer_ids,
                 buffer_info=self._mha_buffer_info(),
             ),
+        )
+
+    def _has_qsa_nvfp4_scales(self) -> bool:
+        return (
+            isinstance(self.quant_method, QSANVFP4KVCacheMethod)
+            and self.k_scale_buffer is not None
+        )
+
+    def _qsa_nvfp4_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """QSA NVFP4 KV as host assembly moves it: the packed E2M1 rows form the
+        KV pool (uint8, ``head_dim // 2`` bytes per head), and the token-linear
+        E4M3 block scales ride as key-row sidecars indexed by the same KV slots.
+
+        Global scales are per-layer constants, not per-page data, so HiCache
+        never moves them (storage keys carry the format instead)."""
+        import msgspec
+
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        packed = msgspec.structs.replace(
+            self._mha_buffer_info(),
+            head_dim=self.k_buffer[0].shape[-1],
+            v_head_dim=self.v_buffer[0].shape[-1],
+            scales=None,
+        )
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=packed,
+            ),
+            *(
+                DevicePoolInfo(
+                    pool_name=name,
+                    indices_from_pool=PoolName.KV,
+                    layer_ids=self.model_layer_ids,
+                    buffer_info=IndexKeyBufferInfo(
+                        page_size=self.page_size,
+                        compress_ratio=1,
+                        key_layout=IndexKeyLayout.KEY_ROWS,
+                        buffers=tuple(buffers),
+                    ),
+                )
+                for name, buffers in (
+                    (PoolName.KV_K_SCALE, self.k_scale_buffer),
+                    (PoolName.KV_V_SCALE, self.v_scale_buffer),
+                )
+            ),
+        )
+
+    def get_kv_scale_size_bytes(self) -> int:
+        """Bytes of token-linear block scales that HiCache moves as sidecars."""
+        if not self._has_qsa_nvfp4_scales():
+            return 0
+        return int(
+            get_tensor_size_bytes(self.k_scale_buffer)
+            + get_tensor_size_bytes(self.v_scale_buffer)
         )
 
     def _mha_buffers(self):

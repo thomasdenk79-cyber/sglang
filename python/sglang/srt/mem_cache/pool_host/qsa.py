@@ -16,13 +16,14 @@ class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        pool_name: str = "qsa_indexer",
     ):
         buffer_info.validate()
         # A full-KV page and its compressed groups share ownership. Packing the
         # groups into a byte row lets the existing whole-page kernels move both
         # coordinate spaces using the same full-KV page number.
         super().__init__(
-            pool_name="qsa_indexer",
+            pool_name=pool_name,
             device_buffers=list(buffer_info.page_views()),
             item_bytes=buffer_info.page_bytes,
             num_host_pages=num_host_pages,
@@ -40,3 +41,19 @@ class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
+
+
+class QSAKVScalePoolHost(QSAIndexerPoolHost):
+    """Page-row mirror of QSA NVFP4 token-linear KV block scales.
+
+    The scales share the full-KV slot space one row per token, so they reuse the
+    compressed-key mirror at compression ratio 1: whole KV pages move with the
+    packed FP4 rows in the KV host pool, under the same host page numbers."""
+
+    def __init__(self, buffer_info: IndexKeyBufferInfo, **kwargs):
+        if buffer_info.compress_ratio != 1:
+            raise ValueError(
+                "QSA KV scale host requires token-linear scales, got "
+                f"compress_ratio={buffer_info.compress_ratio}"
+            )
+        super().__init__(buffer_info, **kwargs)
