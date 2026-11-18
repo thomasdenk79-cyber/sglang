@@ -1738,8 +1738,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>QSA (Qwen4-Exp) decode and target verify with an `fp8_e4m3` KV cache on SM120: read the selected KV directly from the pool in a split-K CUDA kernel instead of packing it into a bf16 scratch for FlashInfer's trtllm decode. Outputs differ from the default path at bf16 rounding level.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>QSA (Qwen4-Exp) decode and target verify with an `fp8_e4m3` KV cache on SM120: read the selected KV directly from the pool in a split-K CUDA kernel instead of packing it into a bf16 scratch for FlashInfer's trtllm decode. Outputs differ from the default path at bf16 rounding level. Also serves an NVFP4 KV pool when `SGLANG_QSA_NVFP4_SCRATCH=fp8`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QSA_NVFP4_SCRATCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dtype of the scratch the QSA NVFP4 dequantizing gathers write. `fp8` (default) stores value / (6 * global_scale) -- the E4M3 range cannot be exceeded -- so the scratch matches the FP8-cache layout, halves the attention scratch bytes and enables `SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA` on NVFP4; consumers undo the descale like an FP8 pool's `k_scale`/`v_scale`. `bf16` keeps the legacy lossless true-value scratch at double the bytes. `fp8` adds one E4M3 rounding step relative to `bf16`; compare NLL/accuracy when in doubt. Unknown values abort startup.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>fp8</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FP8_BLOCK_GEMV</code></td>

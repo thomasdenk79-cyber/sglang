@@ -285,6 +285,9 @@ def pack_qsa_prefill_kv_nvfp4(
 # E4M3 range provably -- ``|e2m1 * block_scale| / 6 <= 6 * 448 / 6 == 448`` --
 # and the downstream kernels undo it exactly like an FP8 KV pool's
 # k_scale/v_scale: the true value is ``stored * descale``.
+# The same two constants exist as literals in layers/quantization/
+# kvfp4_tensor.py (that file keeps constants as literals by convention); a
+# unit test pins the two definitions equal.
 E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 
@@ -301,10 +304,10 @@ def nvfp4_fp8_descale(global_scale: torch.Tensor) -> torch.Tensor:
 def nvfp4_fp8_gather_scale(global_scale: torch.Tensor) -> torch.Tensor:
     """The global scale the gather kernel must apply for an FP8 (descaled) scratch.
 
-    ``g / descale`` is exactly ``1 / E2M1_MAX``; it stays a [1] device tensor so
-    a captured gather reads it on replay. A zero (uninitialized) global scale
-    maps to a zero gather scale, matching the plain dequant's all-zero output
-    instead of producing NaN.
+    ``g / (E2M1_MAX * g)`` reproduces ``1 / E2M1_MAX`` up to one fp32 ulp; it
+    stays a [1] device tensor so a captured gather reads it on replay. A zero
+    (uninitialized) global scale maps to a zero gather scale, matching the
+    plain dequant's all-zero output instead of producing NaN.
     """
     descale = global_scale * E2M1_MAX
     return torch.where(descale == 0, torch.zeros_like(descale), global_scale / descale)
