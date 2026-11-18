@@ -347,6 +347,23 @@ def _completion_seconds(completion) -> float:
         return 0.0
 
 
+def resolve_stream_device(device, engine) -> torch.device:
+    """Return ``device`` with an explicit index (``set_device`` rejects bare ``cuda``).
+
+    The H2D stream was created on the scheduler thread's current device, so its
+    index is authoritative; this worker thread's own current device defaults to 0.
+    """
+    device = torch.device(device)
+    if device.type != "cuda" or device.index is not None:
+        return device
+    stream_device = getattr(
+        getattr(engine, "host_to_device_stream", None), "device", None
+    )
+    if isinstance(stream_device, torch.device) and stream_device.index is not None:
+        return stream_device
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def streamed_page_transfer(cc, operation) -> int:
     """IO-worker body of a streamed prefetch; returns the completed KV pages
     (all or none). Puts exactly one progress ack per storage batch, like the
@@ -465,7 +482,7 @@ def streamed_page_transfer(cc, operation) -> int:
             completion.finish_event.synchronize()
 
     ok = False
-    device = torch.device(cc.device)
+    device = resolve_stream_device(cc.device, plan.engine)
     try:
         if device.type == "cuda":
             # The current device is per thread; the worker's default is 0.
