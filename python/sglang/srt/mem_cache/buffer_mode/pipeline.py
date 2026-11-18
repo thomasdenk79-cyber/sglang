@@ -26,6 +26,7 @@ verification; a violation surfaces as an unexplained collective hang.
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 from collections import deque
 from dataclasses import replace
@@ -36,6 +37,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRACTION
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -43,6 +45,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     InsertResult,
     MatchPrefixParams,
+)
+from sglang.srt.mem_cache.buffer_mode.stream import (
+    BufferStreamPlan,
+    StreamStats,
+    h2d_quota_tokens,
+    plan_stream_chunks,
+    ring_tokens,
+    stream_chunk_tokens,
+    stream_enabled,
+    stream_inflight,
 )
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.hicache_storage import (
@@ -146,6 +158,9 @@ class _StagedPrefetch(msgspec.Struct):
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
+    # Streamed restore: the hit's device rows, already filled, unpublished.
+    device_indices: Optional[torch.Tensor] = None
+    stream_started_at: float = 0.0
 
 
 class _OngoingBufferLoadBack(msgspec.Struct):
@@ -346,11 +361,18 @@ class BufferModePipeline:
     _swa_tail_only: bool = False
 
     def reset(self) -> None:
+        # A worker still waiting on a stream's grants must not hang.
+        for stream_plan in getattr(self, "_streams", {}).values():
+            stream_plan.gate.close()
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
         # enqueue-time prefix context, completed prefetches staged until
         # prefill admission, and load-backs in flight (keyed by synthetic
         # negative ack id).
         self.pending_hit_allocs: deque = deque()
+        # Streamed restores in flight, by prefetch operation id.
+        self._streams: dict[int, BufferStreamPlan] = {}
+        self._stream_last_tick: Optional[float] = None
+        self._stream_baseline_step_s = 0.0
         self._staged_admission_defers: dict[CacheRequestHandle, int] = {}
         self._prefetch_prefix_ctx: dict[
             CacheRequestHandle, tuple[list[int], Optional[str], Optional[str]]
@@ -485,6 +507,7 @@ class BufferModePipeline:
         """No queued, staged, or in-flight buffer-mode work or anchor pins."""
         return not (
             self.pending_hit_allocs
+            or self._streams
             or self.staged_prefetches
             or self.ongoing_buffer_load_back
             or self.pending_write_queue
@@ -1286,6 +1309,14 @@ class BufferModePipeline:
         """
         cache = self._cache
         cc = cache.cache_controller
+        if stream_enabled() and not cc.can_fit_prefetch_host_buffers(
+            operation, hit_tokens
+        ):
+            streamed = self._try_stream_prefetch(
+                operation, info, hit_tokens, aux_hit_tokens
+            )
+            if streamed is not None:
+                return streamed
         if self._reject_oversized_prefetch(operation, hit_tokens):
             return True
         host_indices, alloc_len = self._allocate_prefetch_host_indices(
@@ -1401,6 +1432,230 @@ class BufferModePipeline:
         )
         cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
         cc.prefetch_buffer.put(operation)
+
+    # ---- streamed restore (SGLANG_HICACHE_BUFFER_STREAM) ----
+
+    def _full_allocator(self):
+        allocator = self._cache.token_to_kv_pool_allocator
+        return getattr(allocator, "full_attn_allocator", allocator)
+
+    @staticmethod
+    def _single_rank(cc) -> bool:
+        group = getattr(cc, "tp_group", None)
+        if group is None or not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_world_size(group) == 1
+
+    def _stream_supported(self, operation: PrefetchOperation, hit_tokens: int) -> bool:
+        cache = self._cache
+        cc = cache.cache_controller
+        allocator = self._full_allocator()
+        return (
+            getattr(cc, "kv_storage", None) is None
+            and not getattr(cc, "is_kv_sharded", False)
+            # Grants follow IO-worker timing, so ranks would allocate
+            # different rows: single-rank attention only.
+            and self._single_rank(cc)
+            and not isinstance(allocator, PageInterleavePoolAllocator)
+            and next(iter(self._swa_components()), None) is None
+            and hit_tokens > 0
+            and hit_tokens == len(operation.hash_value) * cache.page_size
+            # Never reserve more rows than the pool can give besides headroom.
+            and hit_tokens + envs.SGLANG_HICACHE_BUFFER_STREAM_DEVICE_HEADROOM.get()
+            <= allocator.size
+        )
+
+    def _try_stream_prefetch(
+        self,
+        operation: PrefetchOperation,
+        info: _OngoingPrefetch,
+        hit_tokens: int,
+        aux_hit_tokens: int,
+    ) -> Optional[bool]:
+        """Queue an oversize hit as a streamed restore through a ring of
+        ``inflight`` chunk slots. None leaves the hit to the regular path
+        (which declines it); otherwise the allocate_and_queue_prefetch
+        contract: False parks, True queued."""
+        if not self._stream_supported(operation, hit_tokens):
+            return None
+        cache = self._cache
+        cc = cache.cache_controller
+        page_size = cache.page_size
+        chunks = plan_stream_chunks(
+            hit_tokens, stream_chunk_tokens(page_size), page_size, stream_inflight()
+        )
+        ring_len = ring_tokens(chunks)
+        # Trailing state pools (Mamba) are staged for the whole hit's end; a
+        # trimmed device head already pinned that endpoint.
+        set_sidecar = operation.sidecar_hash_values is None
+        if set_sidecar:
+            operation.sidecar_hash_values = list(operation.hash_value)
+            operation.sidecar_hit_pages = len(operation.hash_value)
+        if not cc.can_fit_prefetch_host_buffers(operation, ring_len):
+            if set_sidecar:
+                operation.sidecar_hash_values = None
+                operation.sidecar_hit_pages = 0
+            return None
+        request = operation.handle
+        ring, _ = self._allocate_prefetch_host_indices(operation, ring_len)
+        if ring is None:
+            return self._defer_prefetch_for_host_capacity(
+                request, max(ring_len, aux_hit_tokens)
+            )
+        if not cache._alloc_prefetch_aux_staging(info, aux_hit_tokens):
+            cc.append_host_mem_release(host_indices=ring)
+            return self._defer_prefetch_for_host_capacity(
+                request, max(ring_len, aux_hit_tokens)
+            )
+        bytes_per_token = self._stream_bytes_per_token(operation)
+        stream_plan = BufferStreamPlan(
+            request=request,
+            chunks=chunks,
+            slot_tokens=chunks[0].tokens,
+            ring_host_indices=ring,
+            ring_units=self.host_allocation_units(ring, operation.pool_transfers),
+            engine=self._stream_engine(),
+            stats=StreamStats(
+                tokens=hit_tokens,
+                chunks=len(chunks),
+                inflight=ring_len // chunks[0].tokens,
+                bytes_per_token=bytes_per_token,
+            ),
+            quota_tokens=h2d_quota_tokens(bytes_per_token, page_size),
+        )
+        cache._resolve_storage_prefetch_tokens(request, 0, reason="host_capacity")
+        operation.storage_hit_count = hit_tokens
+        operation.host_indices = ring
+        operation.buffer_stream = stream_plan
+        # The ring is released by finish_stream_operation, never by the
+        # generic prefix/tail frees: those see an empty bounce.
+        operation.buffer_host_occupied_units = 0
+        operation.ack_releases_incomplete_host_indices = False
+        cache.ongoing_prefetch[request] = info._replace(host_indices=ring[:0])
+        cc.prefetch_tokens_occupied += stream_plan.ring_units
+        self._streams[operation.id] = stream_plan
+        cc.prefetch_buffer.put(operation)
+        logger.info(
+            "HiCache buffer stream restore queued req=%s tokens=%d chunks=%d "
+            "chunk_tokens=%d ring_tokens=%d",
+            request.rid,
+            hit_tokens,
+            len(chunks),
+            chunks[0].tokens,
+            ring_len,
+        )
+        return True
+
+    def _stream_engine(self):
+        cc = self._cache.cache_controller
+        engine = getattr(cc, "_buffer_stream_engine", None)
+        if engine is None:
+            from sglang.srt.mem_cache.l2_transfer import L2TransferEngine
+
+            engine = L2TransferEngine(cc.io_backend)
+            if torch.cuda.is_available() and torch.device(cc.device).type == "cuda":
+                # Lowest priority (the default is already the least): the
+                # restore yields SMs to the forward's kernels.
+                least, _ = torch.cuda.Stream.priority_range()
+                engine.host_to_device_stream = torch.cuda.Stream(
+                    device=cc.device, priority=least
+                )
+            cc._buffer_stream_engine = engine
+        return engine
+
+    def _stream_bytes_per_token(self, operation: PrefetchOperation) -> int:
+        host = self._cache.cache_controller.mem_pool_host
+        total = getattr(host.anchor_entry.host_pool, "size_per_token", 0) or 0
+        for t in operation.pool_transfers or ():
+            if t.indices_from_pool == PoolName.KV:
+                entry = host.entry_map.get(t.name)
+                if entry is not None:
+                    total += getattr(entry.host_pool, "size_per_token", 0) or 0
+        return int(total)
+
+    def tick_streams(self) -> None:
+        """Per scheduler iteration: reserve the next chunks' device rows and
+        deposit the H2D quota.
+
+        Rows are reserved progressively, at most ``inflight`` chunks ahead
+        of the IO worker, evicting only unlocked (cold) tree nodes and only
+        while ``DEVICE_HEADROOM`` rows stay free, so running requests never
+        wait on a restore. The reserved rows stay unpublished (owned by the
+        plan) until the whole hit is on the device. ``H2D_MB_PER_ITER`` is
+        shared by the restores in flight; called right after the previous
+        forward was launched, so the paced copies run beside it."""
+        now = time.perf_counter()
+        last, self._stream_last_tick = self._stream_last_tick, now
+        if not self._streams:
+            if last is not None:
+                step = now - last
+                base = self._stream_baseline_step_s
+                self._stream_baseline_step_s = (
+                    step if base == 0 else 0.9 * base + 0.1 * step
+                )
+            return
+        headroom = envs.SGLANG_HICACHE_BUFFER_STREAM_DEVICE_HEADROOM.get()
+        allocator = self._full_allocator()
+        cc = self._cache.cache_controller
+        share = len(self._streams)
+        for stream_plan in self._streams.values():
+            stats = stream_plan.stats
+            if last is not None:
+                stats.step_s_sum += now - last
+                stats.steps += 1
+            while stream_plan.next_grant < len(stream_plan.chunks):
+                chunk = stream_plan.chunks[stream_plan.next_grant]
+                if chunk.index - stream_plan.gate.taken >= stats.inflight:
+                    break
+                if not self._ensure_full_capacity(chunk.tokens + headroom):
+                    break
+                rows = allocator.alloc(chunk.tokens)
+                if rows is None:
+                    break
+                fence = None
+                if rows.is_cuda:
+                    fence = torch.cuda.Event()
+                    fence.record(cc.load_fence_stream or torch.cuda.current_stream())
+                stream_plan.device_parts[chunk.index] = rows
+                stream_plan.gate.grant(chunk.index, (rows, fence))
+                stream_plan.next_grant += 1
+            quota = stream_plan.quota_tokens
+            if quota:
+                page_size = self._cache.page_size
+                piece = max(page_size, quota // share // page_size * page_size)
+                stream_plan.gate.deposit(piece, cap=quota)
+
+    def finish_stream_operation(self, operation: PrefetchOperation) -> None:
+        """The streamed prefetch's IO is over (completed_req ack): every H2D
+        has completed. Release the ring, and the device rows unless the
+        staged prefetch took them."""
+        stream_plan = self._streams.pop(operation.id, None)
+        if stream_plan is None:
+            return
+        stream_plan.gate.close()
+        cc = self._cache.cache_controller
+        # As the regular ack's incomplete-tail release: side pools the
+        # sidecar read never settled are freed with the ring.
+        cc.append_host_mem_release(
+            stream_plan.ring_host_indices,
+            operation.pool_transfers if not operation.pool_transfers_done else None,
+        )
+        cc.prefetch_tokens_occupied -= stream_plan.ring_units
+        parts = stream_plan.take_device_parts()
+        if not stream_plan.staged and parts:
+            self._full_allocator().free(torch.cat(parts))
+        stats = stream_plan.stats
+        stats.baseline_step_s = self._stream_baseline_step_s
+        logger.info(stats.format(stream_plan.request.rid))
+
+    def streamed_device_tokens(self, req: Req) -> int:
+        """Rows of the staged hit already resident (streamed), which
+        admission must not charge again."""
+        f = self.staged_prefetches.get(req.cache_request_handle)
+        plan = req.staged_prefetch_plan
+        if f is None or f.device_indices is None or plan is None:
+            return 0
+        return plan.full_tokens
 
     def try_lock_anchor(
         self, request: CacheRequestHandle, remaining_full_tokens: int
@@ -1757,15 +2012,24 @@ class BufferModePipeline:
         if occupied_tokens is None:
             occupied_tokens = self.host_allocation_units(host_indices, aux_xfers)
 
-        staged = self._build_staged_prefetch(
-            request,
-            info,
-            prefix_tokens,
-            num_tokens,
-            hash_value,
-            aux_xfers,
-            occupied_tokens,
-        )
+        stream_plan = getattr(operation, "buffer_stream", None)
+        if stream_plan is not None and num_tokens != stream_plan.tokens:
+            # A streamed restore is all-or-nothing.
+            staged = None
+        else:
+            staged = self._build_staged_prefetch(
+                request,
+                info,
+                prefix_tokens,
+                num_tokens,
+                hash_value,
+                aux_xfers,
+                occupied_tokens,
+            )
+        if staged is not None and stream_plan is not None:
+            staged.device_indices = stream_plan.device_rows()
+            stream_plan.staged = True
+            staged.stream_started_at = stream_plan.started_at
         if staged is None:
             # Nothing usable fetched: recompute.
             cache.discard_storage_prefetch_accounting(request)
@@ -2063,6 +2327,10 @@ class BufferModePipeline:
         load_back_id: int,
         load_xfers: list[PoolTransfer],
     ) -> tuple[Optional[_OngoingBufferLoadBack], str]:
+        if f.device_indices is not None:
+            return self._queue_streamed_load_back(
+                req, f, plan, load_back_id, load_xfers
+            )
         if not self._ensure_full_capacity(plan.full_tokens):
             return None, "full"
         cache = self._cache
@@ -2097,6 +2365,66 @@ class BufferModePipeline:
                 hash_values=f.hash_values,
                 aux_device_releases=[],
                 device_indices=device_indices,
+                load_transfers=load_xfers,
+                load_contexts=load_contexts,
+            ),
+            "",
+        )
+
+    def _queue_streamed_load_back(
+        self,
+        req: Req,
+        f: _StagedPrefetch,
+        plan: StagedPrefetchPlan,
+        load_back_id: int,
+        load_xfers: list[PoolTransfer],
+    ) -> tuple[Optional[_OngoingBufferLoadBack], str]:
+        """Publish a streamed hit: its KV and KV-derived rows are already on
+        the device; only the side pools (Mamba state) still load from their
+        host staging, bound to the streamed rows."""
+        cache = self._cache
+        trim_tokens = plan.device_prefix_len - f.matched_len
+        rows = f.device_indices[trim_tokens:]
+        load_xfers[:] = [t for t in load_xfers if t.indices_from_pool != PoolName.KV]
+        load_contexts: list[BufferLoadBackContext] = []
+        for component in cache.components.values():
+            load_context = component.prepare_buffer_load_back(req, f.aux_xfers)
+            if load_context is None:
+                for prepared in load_contexts:
+                    prepared.finalize_allocation(success=False)
+                return None, component.component_type.name.lower()
+            load_contexts.append(load_context)
+            load_xfers.extend(load_context.load_xfers)
+        queued = cache.cache_controller.load(
+            host_indices=torch.empty((0,), dtype=torch.int64),
+            node_id=load_back_id,
+            extra_pools=load_xfers or None,
+            anchor_indices=rows,
+        )
+        for load_context in load_contexts:
+            load_context.finalize_allocation(success=queued is not None)
+        if queued is None:
+            return None, "full_or_aux"
+        if trim_tokens:
+            # The device prefix grew over the head meanwhile: drop its copy.
+            self._full_allocator().free(f.device_indices[:trim_tokens])
+        f.device_indices = None
+        logger.info(
+            "HiCache buffer stream publish req=%s tokens=%d time_to_publish_s=%.3f",
+            req.rid,
+            plan.full_tokens,
+            time.perf_counter() - f.stream_started_at,
+        )
+        return (
+            _OngoingBufferLoadBack(
+                request=f.request,
+                num_tokens=plan.full_tokens,
+                occupied_tokens=f.occupied_tokens,
+                aux_xfers=f.aux_xfers,
+                host_indices=f.host_indices,
+                hash_values=f.hash_values,
+                aux_device_releases=[],
+                device_indices=rows,
                 load_transfers=load_xfers,
                 load_contexts=load_contexts,
             ),
@@ -2186,6 +2514,9 @@ class BufferModePipeline:
         if staged is None:
             return False
         self._cache._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
+        if staged.device_indices is not None:
+            self._full_allocator().free(staged.device_indices)
+            staged.device_indices = None
         self._free_staging_now(staged.host_indices, staged.aux_xfers)
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True

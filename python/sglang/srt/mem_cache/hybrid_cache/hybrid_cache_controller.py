@@ -245,6 +245,8 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
+        # Buffer mode: a streamed restore's plan (see buffer_mode/stream.py).
+        self.buffer_stream = None
 
     def mark_terminate(self):
         with self._lock:
@@ -1878,7 +1880,14 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
-        kv_completed_pages = super()._page_transfer(operation)
+        if getattr(operation, "buffer_stream", None) is not None:
+            from sglang.srt.mem_cache.buffer_mode.stream import (
+                streamed_page_transfer,
+            )
+
+            kv_completed_pages = streamed_page_transfer(self, operation)
+        else:
+            kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
         self._page_transfer_sidecar(operation, kv_completed_pages)
