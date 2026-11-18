@@ -167,6 +167,9 @@ def _w8a16_gemv_kernel(
         # Gated RMSNorm folded into the A-load; the group is exactly one
         # BLOCK_K tile (asserted by the planner), so the row statistics are
         # local to the tile and nothing extra is read for them.
+        # Everything read before pdl_wait must be memory the preceding kernel
+        # does not write: no caller passes a norm= today, and one that passes a
+        # norm weight produced in-stream would read it a kernel too early.
         norm_w = tl.load(nw_ptr + offs_k).to(tl.float32)
     # x comes from the previous kernel; the weight/scale loads below are all
     # inside the reduction loop, so the wait sits at the top and what PDL buys
@@ -525,7 +528,10 @@ def _launch(
         W_KN=(w.stride(0) == 1) if w_kn is None else w_kn,
         USE_DOT=use_dot,
         USE_PDL=pdl,
-        launch_pdl=pdl,
+        # launch_pdl is a CUDA-only Triton launch kwarg; the HIP backend has no
+        # such option and rejects unknown kwargs, so omit it rather than pass
+        # False. The kernel body's USE_PDL above stays from the same read.
+        **({"launch_pdl": True} if pdl else {}),
         SEG_NB0=seg_nb0,
         NORM_G=norm_g,
         NORM_SIGMOID=norm_sigmoid,

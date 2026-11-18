@@ -25,9 +25,17 @@ Two things are needed per kernel:
 Both are gated on :func:`triton_pdl_enabled` (``SGLANG_TRITON_PDL``, default
 off; ``on``/``enable`` are accepted spellings, anything unparsable raises at
 the launch instead of silently keeping the feature off). When it is false the
-``griddepcontrol`` instructions are not traced at all and ``launch_pdl=False``
-is Triton's own default: the generated PTX and the launch config are identical
+``griddepcontrol`` instructions are not traced at all and ``launch_pdl`` keeps
+Triton's own default, so the generated PTX and the launch config are identical
 to the un-instrumented build.
+
+``launch_pdl`` is omitted rather than passed as ``False`` when the flag is off:
+it is declared only by Triton's CUDA backend (``CUDAOptions``), ``HIPOptions``
+has no such field, and ``JITFunction._pack_args`` raises ``KeyError`` for a
+launch kwarg the selected backend's options do not carry. An unconditional
+``launch_pdl=`` therefore breaks every HIP launch, which is why the instrumented
+sites spell it ``**({"launch_pdl": True} if pdl else {})`` like the rest of the
+tree.
 
 The JIT CUDA kernels (``kernels/jit/csrc``) that do this on their own via
 ``PDLWaitPrimary`` / ``PDLTriggerSecondary`` and the upstream Triton kernels
@@ -37,8 +45,8 @@ this flag.
 
 from __future__ import annotations
 
-import functools
 import os
+from typing import Optional
 
 import triton
 import triton.language as tl
@@ -48,7 +56,9 @@ __all__ = ["triton_pdl_enabled", "pdl_wait", "pdl_trigger"]
 
 _FLAG = "SGLANG_TRITON_PDL"
 # Keep in sync with EnvBoolCompat in sglang/srt/environ.py; _flag_set reads
-# the registry when sglang.srt is importable and mirrors it otherwise.
+# the registry when sglang.srt is importable and mirrors it otherwise. "on"
+# is HyperBurst's spelling (its _detect accepts 1/true/yes/on), "enable" is
+# this fork's addition so a launch script that says "enable" does not raise.
 _TRUE_SPELLINGS = ("true", "1", "yes", "y", "on", "enable")
 _FALSE_SPELLINGS = ("false", "0", "no", "n", "off", "disable")
 
@@ -78,20 +88,40 @@ def _flag_set() -> bool:
         raise ValueError(f'"{raw}" is not a valid boolean value for {_FLAG}')
 
 
-@functools.cache
+_PDL_DEVICE_VERDICT: Optional[bool] = None
+
+
+def _probe_pdl_support() -> Optional[bool]:
+    """Ask the tree's own predicate; ``None`` means the probe itself failed."""
+    try:
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+
+        return bool(is_arch_support_pdl())
+    except Exception:
+        return None
+
+
 def _device_supports_pdl() -> bool:
     """Device gate probed on first launch, never at import.
 
     ``current_arch`` initialises CUDA on its first call, so probing eagerly
     would set the CUDA context before device selection/fork in whatever
-    process imports the kernels package first.
+    process imports the kernels package first. Only a definitive answer is
+    kept: a probe that raised (driver not ready at the very first instrumented
+    launch, a transient CUDA failure) is retried on the next launch instead of
+    sticking as ``False`` for the life of the process, which would otherwise
+    let a flag-on arm run the whole decode silently without PDL.
     """
-    try:
-        from sglang.kernels.jit.utils import is_arch_support_pdl
+    global _PDL_DEVICE_VERDICT
+    if _PDL_DEVICE_VERDICT is None:
+        _PDL_DEVICE_VERDICT = _probe_pdl_support()
+    return _PDL_DEVICE_VERDICT is True
 
-        return is_arch_support_pdl()
-    except Exception:
-        return False
+
+def _reset_pdl_device_gate() -> None:
+    """Forget the cached verdict; the predicate is swapped between test cases."""
+    global _PDL_DEVICE_VERDICT
+    _PDL_DEVICE_VERDICT = None
 
 
 def triton_pdl_enabled() -> bool:

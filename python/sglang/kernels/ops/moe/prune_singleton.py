@@ -28,9 +28,10 @@ off, so a pruned row keeps the surviving weights as-is and loses the dropped
 routing mass.
 
 The work is one single-CTA Triton kernel over the ``[M, k]`` top-k tensors, in
-place, without host sync or allocation, so it is CUDA-graph capturable once
-the histogram scratch exists. It changes the model output (lossy); defaults
-leave it off.
+place and without host sync, so it is CUDA-graph capturable once the histogram
+scratch exists. ``RENORM`` additionally allocates the pre-prune row sum and
+launches the rescale kernels on top of that; it is off by default, like every
+other knob here. The feature changes the model output (lossy).
 
 The launch honours ``SGLANG_TRITON_PDL`` (see ``sglang.kernels.triton_pdl``);
 with the flag off the PTX and the launch config are identical to the
@@ -250,6 +251,47 @@ def _kernel():
     return _prune_singleton_kernel
 
 
+def _launch_prune_kernel_(
+    *,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    cnt: Optional[torch.Tensor],
+    m: int,
+    k: int,
+    num_expert_slots: int,
+    num_shared_cols: int,
+    cfg: PruneConfig,
+) -> None:
+    """Launch the prune kernel: one CTA covering the whole ``[m, k]`` block.
+
+    ``cnt=None`` selects the pairwise counting path inside the kernel.
+    """
+    import triton
+
+    pdl = triton_pdl_enabled()
+    # launch_pdl is a CUDA-only Triton launch kwarg; the HIP backend has no
+    # such option and rejects unknown kwargs, so omit it rather than pass False.
+    _kernel()[(1,)](
+        topk_ids,
+        topk_weights,
+        cnt if cnt is not None else topk_ids,
+        m,
+        cfg.tau,
+        cfg.min_rank,
+        num_expert_slots,
+        k - num_shared_cols,
+        K=k,
+        MP=triton.next_power_of_2(m),
+        KP=triton.next_power_of_2(k),
+        SENTINEL_=SENTINEL,
+        KEEP_IDS=cfg.keep_ids,
+        PAIRWISE=cnt is None,
+        USE_PDL=pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if pdl else {}),
+    )
+
+
 def maybe_prune_singleton_routes_(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -289,8 +331,6 @@ def maybe_prune_singleton_routes_(
         )
         return
 
-    import triton
-
     before = (
         topk_weights[:, : k - num_shared_cols].sum(dim=-1, keepdim=True)
         if cfg.renorm
@@ -314,25 +354,15 @@ def maybe_prune_singleton_routes_(
                 num_expert_slots, dtype=torch.int32, device=topk_ids.device
             )
             _COUNTS[key] = cnt
-    pdl = triton_pdl_enabled()
-    _kernel()[(1,)](
-        topk_ids,
-        topk_weights,
-        cnt if cnt is not None else topk_ids,
-        m,
-        cfg.tau,
-        cfg.min_rank,
-        num_expert_slots,
-        k - num_shared_cols,
-        K=k,
-        MP=triton.next_power_of_2(m),
-        KP=triton.next_power_of_2(k),
-        SENTINEL_=SENTINEL,
-        KEEP_IDS=cfg.keep_ids,
-        PAIRWISE=cnt is None,
-        USE_PDL=pdl,
-        launch_pdl=pdl,
-        num_warps=4,
+    _launch_prune_kernel_(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        cnt=cnt,
+        m=m,
+        k=k,
+        num_expert_slots=num_expert_slots,
+        num_shared_cols=num_shared_cols,
+        cfg=cfg,
     )
     if before is not None:
         _renorm_pruned_rows_(topk_weights, before, k - num_shared_cols)

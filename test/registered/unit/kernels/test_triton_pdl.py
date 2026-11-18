@@ -147,11 +147,41 @@ def test_pdl_device_probe_never_raises(monkeypatch):
 
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
     monkeypatch.setattr(jit_utils, "is_arch_support_pdl", boom)
-    triton_pdl._device_supports_pdl.cache_clear()
+    triton_pdl._reset_pdl_device_gate()
     try:
         assert triton_pdl.triton_pdl_enabled() is False
     finally:
-        triton_pdl._device_supports_pdl.cache_clear()
+        triton_pdl._reset_pdl_device_gate()
+
+
+def test_pdl_device_probe_is_not_sticky_after_a_failure(monkeypatch):
+    """A probe that raised must not silence PDL for the rest of the process.
+
+    The first instrumented launch can happen before the driver is ready; if that
+    answer were cached, a ``SGLANG_TRITON_PDL=1`` arm would decode all night
+    with the feature silently off.
+    """
+    import sglang.kernels.jit.utils as jit_utils
+
+    state = {"raises": True}
+
+    def predicate() -> bool:
+        if state["raises"]:
+            raise RuntimeError("driver not ready")
+        return True
+
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", predicate)
+    triton_pdl._reset_pdl_device_gate()
+    try:
+        assert triton_pdl.triton_pdl_enabled() is False
+        state["raises"] = False
+        assert triton_pdl.triton_pdl_enabled() is True
+        # A definitive answer is cached: the predicate is not consulted again.
+        state["raises"] = True
+        assert triton_pdl.triton_pdl_enabled() is True
+    finally:
+        triton_pdl._reset_pdl_device_gate()
 
 
 def test_flag_read_without_srt_falls_back_to_os_environ(monkeypatch):
@@ -277,3 +307,129 @@ def test_fused_sigmoid_mul_off_path_matches_torch():
     out = ew.fused_sigmoid_mul(attn, gate)
     ref = attn * torch.sigmoid(gate)
     torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# Launch kwargs of the PDL-instrumented sites.  Triton validates every launch
+# kwarg against the options class of the selected backend, and only the CUDA
+# backend declares ``launch_pdl``: passing it unconditionally would crash the
+# HIP path with the flag off, which is the shipped default.
+# --------------------------------------------------------------------------
+
+
+class _LaunchRecorder:
+    """Stand in for a JITFunction so a launch's kwargs can be inspected."""
+
+    def __init__(self):
+        self.kwargs = None
+
+    def __getitem__(self, grid):
+        def _run(*args, **kwargs):
+            self.kwargs = kwargs
+
+        return _run
+
+
+def _arm_pdl(monkeypatch, enabled: bool) -> None:
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1" if enabled else "0")
+    monkeypatch.setattr(triton_pdl, "_device_supports_pdl", lambda: enabled)
+
+
+def _gemv_args(module, m: int, n: int, k: int):
+    torch.manual_seed(3)
+    x = torch.randn(m, k).bfloat16()
+    w = (torch.randn(n, k) * 0.05).bfloat16()
+    ws = torch.empty(module._WS_FLOATS)
+    cnt = torch.zeros(module._WS_COUNTERS, dtype=torch.int32)
+    y = torch.empty((m, n), dtype=torch.bfloat16)
+    cfg = module._plan(m, n, k, False, 2, 188)
+    return ws, cnt, x, w, torch.ones(1), y, m, n, k, cfg
+
+
+def _recorded_launch_kwargs(monkeypatch, site: str, enabled: bool) -> dict:
+    """Launch kwargs of one instrumented site, with the kernel call stubbed."""
+    _arm_pdl(monkeypatch, enabled)
+    rec = _LaunchRecorder()
+    if site == "prune":
+        ids = torch.tensor([[7, 3, 4], [7, 5, 9]], dtype=torch.int32)
+        weights = torch.tensor([[0.6, 0.3, 0.1], [0.5, 0.4, 0.1]], dtype=torch.float32)
+        monkeypatch.setattr(ps, "_kernel", lambda: rec)
+        ps._launch_prune_kernel_(
+            topk_ids=ids,
+            topk_weights=weights,
+            cnt=torch.zeros(17, dtype=torch.int32),
+            m=2,
+            k=3,
+            num_expert_slots=17,
+            num_shared_cols=0,
+            cfg=ps.PruneConfig(0.08, 1, 1, 64, False, False),
+        )
+    elif site == "gemv":
+        from sglang.kernels.ops.gemm import sm120_bf16_skinny_gemv as gemv
+
+        monkeypatch.setattr(gemv, "_w8a16_gemv_kernel", rec)
+        ws, cnt, x, w, s, y, m, n, k, cfg = _gemv_args(gemv, 1, 512, 2560)
+        gemv._launch(ws, cnt, x, w, s, y, m, n, k, False, cfg)
+    elif site == "gdn":
+        mixed_qkvz = torch.randn(2, 40, dtype=torch.bfloat16)
+        mixed_ba = torch.randn(2, 8, dtype=torch.bfloat16)
+        monkeypatch.setattr(gdn, "fused_qkvzba_split_reshape_cat_contiguous_kernel", rec)
+        gdn.fused_qkvzba_split_reshape_cat_contiguous(
+            mixed_qkvz, mixed_ba, num_heads_qk=2, num_heads_v=4, head_qk=8, head_v=8
+        )
+    else:
+        raise ValueError(f"unknown instrumented site {site!r}")
+    assert rec.kwargs is not None, f"{site} did not reach the launch"
+    return rec.kwargs
+
+
+@pytest.mark.parametrize("site", ["prune", "gemv", "gdn"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_instrumented_sites_launch_kwargs(monkeypatch, site, enabled):
+    """Flag off omits ``launch_pdl``; flag on sets it, both from one read.
+
+    The off arm is the HIP regression: a site that passes ``launch_pdl=False``
+    unconditionally raises ``KeyError`` there, so the key must be absent.
+    """
+    kwargs = _recorded_launch_kwargs(monkeypatch, site, enabled)
+    assert kwargs["USE_PDL"] is enabled
+    if enabled:
+        assert kwargs["launch_pdl"] is True
+    else:
+        assert "launch_pdl" not in kwargs
+
+
+def test_hip_backend_rejects_the_launch_pdl_kwarg():
+    """Reproduce the HIP crash that the omission above prevents.
+
+    Triton validates each launch kwarg against the options object of the
+    selected backend, so this is the code path a ROCm decode step takes. The
+    CUDA side is pinned by the option-field assertion rather than re-run here:
+    ``TRITON_INTERPRET=1`` replaces JITFunction with InterpretedFunction, so the
+    real ``_pack_args`` is driven unbound with a signature-less kernel (the
+    kwarg check does not read the signature).
+    """
+    import types
+
+    from triton.backends.amd.compiler import HIPOptions, HIPBackend
+    from triton.backends.nvidia.compiler import CUDAOptions
+    from triton.runtime.jit import JITFunction
+
+    # The asymmetry is the whole point: CUDA declares it, HIP does not.
+    assert "launch_pdl" in CUDAOptions.__dataclass_fields__
+    assert "launch_pdl" not in HIPOptions.__dataclass_fields__
+
+    class _Hip:
+        # parse_options reads only .target.arch on this input.
+        target = types.SimpleNamespace(arch="gfx942")
+        parse_options = HIPBackend.parse_options
+
+    kwargs = {"num_warps": 4, "launch_pdl": False}
+    hip = _Hip()
+    assert "launch_pdl" not in vars(hip.parse_options(kwargs))
+
+    class _Kernel:
+        params: list = []
+
+    with pytest.raises(KeyError, match="launch_pdl"):
+        JITFunction._pack_args(_Kernel(), hip, kwargs, {}, [], None)

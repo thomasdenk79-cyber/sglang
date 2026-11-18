@@ -346,7 +346,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         USE_PDL=pdl,
         num_warps=num_warps,
         num_stages=3,
-        launch_pdl=pdl,
+        # launch_pdl is a CUDA-only Triton launch kwarg; the HIP backend has no
+        # such option and rejects unknown kwargs, so omit it rather than pass
+        # False. This launcher does run on HIP (the aiter num_warps tuning above
+        # is MI355X-specific).
+        **({"launch_pdl": True} if pdl else {}),
     )
     return mixed_qkv, z, b, a
 
