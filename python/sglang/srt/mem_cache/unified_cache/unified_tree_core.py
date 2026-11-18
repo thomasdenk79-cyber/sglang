@@ -718,6 +718,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
 
+    def split_for_backup(
+        self, node_id: NodeId, piece_tokens: int
+    ) -> tuple[list[NodeId], list[CacheAction | ComponentAction]]:
+        """Split a node into page-aligned pieces of at most ``piece_tokens``
+        so each can stage for backup on its own. Returns the piece ids head
+        first, and the split actions to apply; the node keeps its id, its
+        tail and its component state (e.g. the Mamba checkpoint)."""
+        from sglang.srt.mem_cache.buffer_mode.stream import split_span
+
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or node is self.root_node
+            or node.key is None
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return [], []
+        piece_ids: list[NodeId] = []
+        actions: list[CacheAction | ComponentAction] = []
+        for length in split_span(len(node.key), piece_tokens, self.page_size)[:-1]:
+            head, action = self._split_node(node.key, node, length)
+            if action is not None:
+                actions.append(action)
+            piece_ids.append(head.id)
+        piece_ids.append(node.id)
+        return piece_ids, actions
+
     def validate_buffer_backup(
         self, node_id: NodeId, expected_key_length: int
     ) -> Optional[BufferBackupState]:

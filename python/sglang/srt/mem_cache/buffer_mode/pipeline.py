@@ -371,6 +371,8 @@ class BufferModePipeline:
         self.pending_hit_allocs: deque = deque()
         # Streamed restores in flight, by prefetch operation id.
         self._streams: dict[int, BufferStreamPlan] = {}
+        # Nodes whose oversize backup splits at the next flush (ordered set).
+        self._oversize_splits: dict[NodeId, None] = {}
         self._stream_last_tick: Optional[float] = None
         self._stream_baseline_step_s = 0.0
         self._staged_admission_defers: dict[CacheRequestHandle, int] = {}
@@ -508,6 +510,7 @@ class BufferModePipeline:
         return not (
             self.pending_hit_allocs
             or self._streams
+            or self._oversize_splits
             or self.staged_prefetches
             or self.ongoing_buffer_load_back
             or self.pending_write_queue
@@ -726,10 +729,14 @@ class BufferModePipeline:
     def end_insert_walk(self) -> None:
         self._walk_admitted = None
 
-    def enqueue_backup_intent(self, node_id: NodeId) -> None:
+    def enqueue_backup_intent(
+        self, node_id: NodeId, *, split_oversize: bool = True
+    ) -> None:
         """Queue one intent per pool with something to write; rejected intents
         are counted and the node re-triggers on a later hit."""
         if not self._cache.enable_storage:
+            return
+        if node_id in self._oversize_splits:
             return
         admitted = self._walk_admitted
         if admitted is not None:
@@ -754,6 +761,13 @@ class BufferModePipeline:
             node_id,
         )
         page_size = self._cache.page_size
+        if (
+            split_oversize
+            and parent_covered
+            and stream_enabled()
+            and self._defer_oversize_split(node_id, intents)
+        ):
+            return
         span = (snapshot.node_id, len(snapshot.key))
         for pool, keys in intents:
             if pool in pending:
@@ -789,6 +803,47 @@ class BufferModePipeline:
             self.pending_write_queue.append(intent)
             self.inflight_backup_pools.setdefault(node_id, set()).add(pool)
             self._retain_queued_span(intent)
+
+    def _defer_oversize_split(
+        self, node_id: NodeId, intents: list[tuple[PoolName, list[str]]]
+    ) -> bool:
+        """An oversize KV span would be dropped: split its node into
+        staging-sized pieces at the next flush instead (the tree must not
+        change during the insert walk that called us). The node's every pool
+        waits, so its state pools still follow the KV of the whole span."""
+        kv_keys = dict(intents).get(PoolName.KV)
+        if not kv_keys or not hasattr(self._cache.tree_core, "split_for_backup"):
+            return False
+        if not self._backup_oversize(*self._sizing(PoolName.KV, kv_keys)):
+            return False
+        self._oversize_splits[node_id] = None
+        return True
+
+    def _backup_piece_tokens(self) -> int:
+        page_size = self._cache.page_size
+        quarter = self._cache.cache_controller.mem_pool_host.size // 4
+        return max(page_size, min(stream_chunk_tokens(page_size), quarter))
+
+    def _run_oversize_splits(self) -> None:
+        cache = self._cache
+        pending, self._oversize_splits = self._oversize_splits, {}
+        piece_tokens = self._backup_piece_tokens()
+        for node_id in pending:
+            piece_ids, actions = cache.tree_core.split_for_backup(
+                node_id, piece_tokens
+            )
+            if actions:
+                cache._apply_cache_actions(actions)
+            if len(piece_ids) > 1:
+                logger.info(
+                    "HiCache buffer backup split node=%s into %d pieces of <=%d tokens",
+                    node_id,
+                    len(piece_ids),
+                    piece_tokens,
+                )
+            # Head first: each piece's parent is then in flight (covered).
+            for piece_id in piece_ids:
+                self.enqueue_backup_intent(piece_id, split_oversize=False)
 
     def _backup_oversize(self, kv_tokens: int, aux_xfers: list[PoolTransfer]) -> bool:
         """True if any pool's staging need exceeds that pool's write-usable
@@ -935,6 +990,8 @@ class BufferModePipeline:
         returning to scheduler admission, where L1 slots can be reused.
         Each staged source stays locked until its D2H ack.
         """
+        if self._oversize_splits:
+            self._run_oversize_splits()
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
