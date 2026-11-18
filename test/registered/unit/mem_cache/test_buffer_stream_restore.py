@@ -8,11 +8,13 @@ import unittest
 from array import array
 from queue import Queue
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
@@ -29,11 +31,17 @@ from sglang.srt.mem_cache.buffer_mode.stream import (
     ring_slice,
     ring_tokens,
     split_piece_ranges,
+    split_span,
     stream_chunk_tokens,
     streamed_page_transfer,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
+from sglang.test.kits.unified_radix_cache import fixtures as _fixtures
+from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -76,6 +84,11 @@ class TestStreamPlanning(unittest.TestCase):
             self.assertEqual(h2d_quota_tokens(1000, 64), 0)
         self.assertEqual(split_piece_ranges(0, 10, 4), [(0, 4), (4, 8), (8, 10)])
         self.assertEqual(split_piece_ranges(0, 10, 0), [(0, 10)])
+
+    def test_split_span_keeps_order_and_alignment(self):
+        self.assertEqual(split_span(1000, 256, 64), [256, 256, 256, 232])
+        self.assertEqual(split_span(512, 256, 64), [256, 256])
+        self.assertEqual(split_span(100, 1000, 64), [100])
 
 
 class TestDriveStream(unittest.TestCase):
@@ -453,6 +466,55 @@ class TestFlagOff(unittest.TestCase):
         with envs.SGLANG_HICACHE_BUFFER_STREAM.override(True):
             pipeline.allocate_and_queue_prefetch(MagicMock(), MagicMock(), 1024, 0)
         pipeline._reject_oversized_prefetch.assert_called_once()
+
+    def test_oversize_backup_split_deferred_only_with_flag(self):
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline._cache = SimpleNamespace(
+            tree_core=SimpleNamespace(split_for_backup=None), page_size=4
+        )
+        pipeline._oversize_splits = {}
+        pipeline._backup_oversize = MagicMock(return_value=True)
+        intents = [(PoolName.KV, ["a", "b"]), (PoolName.MAMBA, ["b"])]
+        self.assertTrue(pipeline._defer_oversize_split(5, intents))
+        self.assertEqual(list(pipeline._oversize_splits), [5])
+        pipeline._backup_oversize.return_value = False
+        self.assertFalse(pipeline._defer_oversize_split(6, intents))
+
+
+class TestSplitForBackup(unittest.TestCase):
+    def test_split_keeps_tail_id_and_hash_chain(self):
+        cfg = CacheConfig(
+            page_size=4, components=(ComponentType.FULL,), kv_size=128, max_context_len=128
+        )
+        with mock.patch.object(_fixtures, "get_device", return_value="cpu"):
+            cache, allocator, _ = build_fixture(cfg)
+        tokens = array("q", range(1, 41))
+        key = RadixKey(tokens)
+        cache.insert(InsertParams(key=key, value=allocator.alloc(len(tokens))))
+        leaf = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        core = cache.tree_core
+        arena = core._node_arena
+        # Hashes only exist with storage; seed one per page to follow them.
+        arena[leaf].hash_value = [f"h{i}" for i in range(10)]
+
+        pieces, actions = core.split_for_backup(leaf, 16)
+        for action in actions:
+            cache._apply_cache_action(action)
+
+        self.assertEqual(pieces[-1], leaf)
+        self.assertEqual([len(arena[p].key) for p in pieces], [16, 16, 8])
+        for parent, child in zip(pieces, pieces[1:]):
+            self.assertIs(arena[child].parent, arena[parent])
+        self.assertEqual(
+            [h for p in pieces for h in arena[p].hash_value],
+            [f"h{i}" for i in range(10)],
+        )
+        snap = core.snapshot_buffer_backup(leaf, True)
+        self.assertEqual(snap.prefix_keys, [f"h{i}" for i in range(8)])
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).last_device_node, leaf
+        )
+        cache.sanity_check()
 
 
 if __name__ == "__main__":

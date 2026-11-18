@@ -98,6 +98,20 @@ def chunk_batches(
     return [(p, min(last, p + batch_pages)) for p in range(first, last, batch_pages)]
 
 
+def split_span(num_tokens: int, piece_tokens: int, page_size: int) -> list[int]:
+    """Page-aligned piece lengths, each at most ``piece_tokens``, covering a
+    span in order (an unaligned tail stays in the last piece)."""
+    piece = max(page_size, piece_tokens - piece_tokens % page_size)
+    lengths = []
+    remaining = num_tokens
+    while remaining > piece:
+        lengths.append(piece)
+        remaining -= piece
+    if remaining > 0:
+        lengths.append(remaining)
+    return lengths
+
+
 @dataclass
 class StreamStats:
     tokens: int
