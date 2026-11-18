@@ -961,6 +961,10 @@ class Envs:
     # Read page files with O_DIRECT (aligned buffers only; else buffered).
     # Buffered reads are served by the page cache when the files are warm.
     SGLANG_HICACHE_FILE_BACKEND_DIRECT_IO = EnvBool(False)
+    # Read page files straight into host pools that expose their page memory
+    # (flat_page_segments), with all pools of a batch in flight at once;
+    # other pools keep the staged copy. 0 restores the staged path everywhere.
+    SGLANG_HICACHE_FILE_BACKEND_ZERO_COPY_READ = EnvBool(True)
     # Buffer mode: restore a storage hit larger than the host arena in
     # chunks streamed through a small pinned ring straight into device rows,
     # and split oversize backups into staging-sized pieces.

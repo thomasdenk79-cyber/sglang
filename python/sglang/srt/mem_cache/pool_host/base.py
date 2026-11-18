@@ -801,6 +801,22 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def flat_page_segments(self, index: int) -> Optional[tuple[tuple[int, int], ...]]:
+        """Host memory behind the flat data page at slot ``index``, for zero-copy reads.
+
+        Returns ``(address, nbytes)`` runs whose concatenation, in order, is the
+        byte layout ``set_from_flat_data_page(index, page)`` consumes: writing a
+        stored page's bytes into them is equivalent to that call. ``None`` when
+        the pool cannot expose its page this way; storage readers then stage
+        the page and call ``set_from_flat_data_page``.
+
+        Only pools whose slot-to-memory mapping stays fixed while the caller
+        owns the slots may implement this (not compacting/shared pools that
+        translate slots under a layout lease): readers write the runs later,
+        from storage I/O threads, without any pool lock.
+        """
+        return None
+
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.
 

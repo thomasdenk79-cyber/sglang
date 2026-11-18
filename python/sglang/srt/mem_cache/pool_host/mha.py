@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -853,6 +853,41 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def flat_page_segments(self, index: int) -> Optional[tuple[tuple[int, int], ...]]:
+        # Subclasses that change the flat page (e.g. MXFP8 scales) stage it.
+        if (
+            type(self).set_from_flat_data_page
+            is not MHATokenToKVPoolHost.set_from_flat_data_page
+        ):
+            return None
+        buf = self.kv_buffer
+        if not isinstance(buf, torch.Tensor) or not buf.is_contiguous():
+            return None
+        index = int(index)
+        if index % self.page_size:
+            return None
+        es = buf.element_size()
+        base = buf.data_ptr()
+        half = buf.stride(0) * es  # K -> V
+        if self.layout == "page_first":
+            run = self.page_size * buf.stride(1) * es
+            start = base + index * buf.stride(1) * es
+            return ((start, run), (start + half, run))
+        if self.layout in ("page_first_direct", "page_head"):
+            run = buf.stride(1) * es
+            start = base + (index // self.page_size) * run
+            return ((start, run), (start + half, run))
+        if self.layout == "layer_first":
+            run = self.page_size * buf.stride(2) * es
+            start = base + index * buf.stride(2) * es
+            layer = buf.stride(1) * es
+            return tuple(
+                (start + kv * half + i * layer, run)
+                for kv in range(2)
+                for i in range(self.layer_num)
+            )
+        return None
+
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
     ):
@@ -1341,6 +1376,38 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def flat_page_segments(self, index: int) -> Optional[tuple[tuple[int, int], ...]]:
+        if (
+            type(self).set_from_flat_data_page
+            is not MHATokenToKOnlyPoolHost.set_from_flat_data_page
+        ):
+            return None
+        buf = self.k_buffer
+        if not isinstance(buf, torch.Tensor) or not buf.is_contiguous():
+            return None
+        index = int(index)
+        if index % self.page_size:
+            return None
+        es = buf.element_size()
+        base = buf.data_ptr()
+        if self.layout == "page_first":
+            return (
+                (
+                    base + index * buf.stride(0) * es,
+                    self.page_size * buf.stride(0) * es,
+                ),
+            )
+        if self.layout == "page_first_direct":
+            run = buf.stride(0) * es
+            return ((base + (index // self.page_size) * run, run),)
+        if self.layout == "layer_first":
+            run = self.page_size * buf.stride(1) * es
+            start = base + index * buf.stride(1) * es
+            return tuple(
+                (start + i * buf.stride(0) * es, run) for i in range(self.layer_num)
+            )
+        return None
 
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
