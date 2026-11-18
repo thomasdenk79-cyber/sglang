@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     _StagedPrefetch,
 )
 from sglang.srt.mem_cache.buffer_mode.stream import (
+    resolve_stream_device,
     BufferStreamPlan,
     StreamChunk,
     StreamGate,
@@ -515,6 +516,23 @@ class TestSplitForBackup(unittest.TestCase):
             cache.match_prefix(MatchPrefixParams(key=key)).last_device_node, leaf
         )
         cache.sanity_check()
+
+
+class TestResolveStreamDevice(unittest.TestCase):
+    def test_bare_cuda_takes_the_stream_index(self):
+        engine = SimpleNamespace(
+            host_to_device_stream=SimpleNamespace(device=torch.device("cuda", 3))
+        )
+        self.assertEqual(resolve_stream_device("cuda", engine), torch.device("cuda", 3))
+
+    def test_explicit_index_and_cpu_are_kept(self):
+        engine = SimpleNamespace(
+            host_to_device_stream=SimpleNamespace(device=torch.device("cuda", 3))
+        )
+        self.assertEqual(
+            resolve_stream_device("cuda:1", engine), torch.device("cuda", 1)
+        )
+        self.assertEqual(resolve_stream_device("cpu", engine), torch.device("cpu"))
 
 
 if __name__ == "__main__":
