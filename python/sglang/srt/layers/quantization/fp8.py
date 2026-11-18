@@ -1443,6 +1443,67 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+        if self._mxfp8_skinny_gemv_enabled():
+            # Materialize the skinny GEMV's per-stream split-K scratch here:
+            # warm-up runs at prefill widths, where apply() never reaches the
+            # GEMV, so the first split-K call would otherwise allocate inside a
+            # CUDA graph capture and put the scratch in that graph's private
+            # pool.
+            from sglang.srt.layers.quantization.mxfp8_skinny_gemv import prealloc
+
+            prealloc(layer.weight.device)
+
+    def _mxfp8_skinny_gemv_enabled(self) -> bool:
+        """Whether this method may route dense MXFP8 linears to the skinny GEMV.
+
+        The method-wide half of the gate: an opt-in flag, an MXFP8 checkpoint on
+        an SM120 CUDA part, and a dense backend that leaves the weight and the
+        UE8M0 scale in the layout the kernel reads.
+        """
+        if not (self.use_mxfp8 and _is_cuda and not self.use_marlin):
+            return False
+        if not envs.SGLANG_MXFP8_SKINNY_GEMV.get():
+            return False
+        from sglang.srt.layers.quantization import mxfp8_skinny_gemv
+
+        if not mxfp8_skinny_gemv.is_sm120():
+            return False
+        backend = self.mxfp8_dense_backend
+        # Only the FlashInfer CUTLASS / CuTe-DSL backends keep layer.weight
+        # row-major [N, K] and the canonical [N, K // 32] UE8M0 bytes in
+        # weight_scale_inv (their swizzled copy lives in
+        # weight_scale_inv_swizzled). trtllm shuffles the weight itself, and
+        # deep_gemm / halops / gfx95 / xpu keep the only usable scale in a
+        # packed layout this kernel cannot index.
+        return bool(
+            backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def _mxfp8_skinny_gemv_ok(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether :meth:`apply` would route this call through the skinny GEMV."""
+        if bias is not None or not isinstance(x, torch.Tensor):
+            # A (fp8, scale) pair or an Mxfp8SwizzledInput belongs to the W8A8
+            # GEMM it was quantized for; a bias is not fused into the GEMV.
+            return False
+        if not self._mxfp8_skinny_gemv_enabled():
+            return False
+        if getattr(layer, "dequantized_bf16", False) or getattr(
+            layer, "aiter_bpreshuffled", False
+        ):
+            return False
+        scale = getattr(layer, "weight_scale_inv", None)
+        weight = getattr(layer, "weight", None)
+        if scale is None or weight is None:
+            return False
+        from sglang.srt.layers.quantization import mxfp8_skinny_gemv
+
+        return mxfp8_skinny_gemv.mxfp8_skinny_gemv_applies(
+            x, weight, scale, max_m=mxfp8_skinny_gemv.gemv_max_m()
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1465,6 +1526,19 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if self._mxfp8_skinny_gemv_ok(layer, x, bias):
+            # Weight-only: BF16 activations, fp32 accumulation, the UE8M0 scale
+            # applied per 32-wide K group inside the kernel. None means the
+            # split-K scratch is not available in this capture, so the W8A8
+            # GEMM below runs unchanged.
+            from sglang.srt.layers.quantization import mxfp8_skinny_gemv
+
+            y = mxfp8_skinny_gemv.mxfp8_skinny_gemv(
+                x, layer.weight, layer.weight_scale_inv
+            )
+            if y is not None:
+                return y
 
         if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
             return fp8_hip.apply_dense(self, layer, x, bias)
