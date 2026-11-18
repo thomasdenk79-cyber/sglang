@@ -2,6 +2,7 @@ import base64
 import functools
 import json
 import os
+import sys
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
@@ -1632,9 +1633,10 @@ class Envs:
     # Everything here is a developer knob for working ON kernels -- building
     # them, inspecting what the compiler produced, and benchmarking them. Flags
     # that select a kernel in production live with their own feature instead.
-    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
-    # point it at a persistent mount to share builds across CI jobs.
-    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # JIT kernel build cache. Defaults to SGLANG_CACHE_DIR/jit (~/.cache/sglang/jit
+    # when that is unset), so a mounted SGLANG_CACHE_DIR keeps the builds across
+    # container restarts; point it elsewhere to share builds across CI jobs.
+    SGLANG_JIT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("jit"))
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -2863,7 +2865,29 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
+        # torch.utils.cpp_extension builds (e.g. hicache_hash_cpp). Torch only
+        # appends an ABI tag to its own default root, so add one here.
+        "TORCH_EXTENSIONS_DIR": os.path.join(
+            base, "torch_extensions", _torch_ext_tag()
+        ),
+        # CuTe DSL file cache; defaults to $TMPDIR, which containers discard.
+        "CUTE_DSL_CACHE_DIR": os.path.join(base, "cute_dsl"),
     }
+
+
+def _torch_ext_tag() -> str:
+    """``py<maj><min>_torch<version>`` without importing torch (cheap at sglang import).
+
+    Keyed on the full torch version, so a new image never loads extensions
+    built against another torch ABI from a shared cache mount.
+    """
+    import importlib.metadata
+
+    py = f"py{sys.version_info.major}{sys.version_info.minor}"
+    try:
+        return f"{py}_torch{importlib.metadata.version('torch')}"
+    except importlib.metadata.PackageNotFoundError:
+        return f"{py}_notorch"
 
 
 def redirect_third_party_caches():
