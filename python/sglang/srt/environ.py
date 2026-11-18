@@ -1979,10 +1979,45 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
-    # FIFO ring slots appended to a --speculative-token-map draft head for non-hot
+    # Dynamic slots appended to a --speculative-token-map draft head for non-hot
     # tokens seen in prompts and accepted outputs, shared by all requests
-    # (0 disables). Needs tp/pp/dp size 1.
+    # (0 disables): the FIFO ring for fifo/tiered, the pool for lru/lfu.
+    # Needs tp/pp/dp size 1.
     SGLANG_SPEC_DYNAMIC_VOCAB_SLOTS = EnvInt(0)
+    # Dynamic draft vocab knobs; see speculative/dynamic_draft_vocab.md.
+    # Policy: fifo (ring of SLOTS) | lru / lfu (scored pool of SLOTS) | tiered
+    # (FIFO ring of SLOTS for prompt+output plus a PROVEN_SLOTS pool fed by
+    # accepted output tokens only, scored by PROVEN_SCORE lru|lfu).
+    SGLANG_SPEC_DYNAMIC_VOCAB_POLICY = EnvStr("fifo")
+    SGLANG_SPEC_DYNAMIC_VOCAB_PROVEN_SLOTS = EnvInt(0)
+    SGLANG_SPEC_DYNAMIC_VOCAB_PROVEN_SCORE = EnvStr("lru")
+    # Decayed-LFU half-life in staged tokens; output tokens weigh OUTPUT_WEIGHT,
+    # prompt tokens 1.
+    SGLANG_SPEC_DYNAMIC_VOCAB_HALF_LIFE = EnvFloat(65536.0)
+    SGLANG_SPEC_DYNAMIC_VOCAB_OUTPUT_WEIGHT = EnvFloat(4.0)
+    # Apply staged tokens every n-th commit (amortizes the update kernels).
+    SGLANG_SPEC_DYNAMIC_VOCAB_COMMIT_EVERY = EnvInt(1)
+    # Score the static map too: only its first STATIC_CORE ids (0 = none) stay
+    # protected; the rest seed the pool as if used STATIC_HORIZON staged tokens
+    # in the future and are demoted once unused for longer.
+    SGLANG_SPEC_DYNAMIC_VOCAB_ADAPTIVE_STATIC = EnvBool(False)
+    SGLANG_SPEC_DYNAMIC_VOCAB_STATIC_CORE = EnvInt(8192)
+    # Optional ranked id list (.pt list or .json) ordering the static map before
+    # the core is cut; default is the map file order.
+    SGLANG_SPEC_DYNAMIC_VOCAB_STATIC_RANK = EnvStr("")
+    SGLANG_SPEC_DYNAMIC_VOCAB_STATIC_HORIZON = EnvFloat(1048576.0)
+    # Pool tokens without an accepted-output use for TTL_S seconds are evicted
+    # first (0 = off); MIN_ROWS live rows are always kept.
+    SGLANG_SPEC_DYNAMIC_VOCAB_TTL_S = EnvFloat(0.0)
+    SGLANG_SPEC_DYNAMIC_VOCAB_MIN_ROWS = EnvInt(0)
+    # Persist learned tokens/scores to STATE_DIR/dvocab-<PROFILE>.pt every
+    # SAVE_INTERVAL seconds (background thread) and pre-seed from it at start.
+    SGLANG_SPEC_DYNAMIC_VOCAB_STATE_DIR = EnvStr("")
+    SGLANG_SPEC_DYNAMIC_VOCAB_PROFILE = EnvStr("default")
+    SGLANG_SPEC_DYNAMIC_VOCAB_SAVE_INTERVAL = EnvFloat(300.0)
+    # Count draft-vocab coverage of accepted tokens (adds a few kernels per
+    # commit) and append "draft vocab: cov=.." to the decode log line.
+    SGLANG_SPEC_DYNAMIC_VOCAB_METRICS = EnvBool(False)
     # Build the Qwen4-Exp MTP draft's embed_tokens / lm_head as one-row
     # placeholders: the EAGLE worker replaces both with the target's tensors
     # before the first forward, so the draft's own pair only raises the start-up
