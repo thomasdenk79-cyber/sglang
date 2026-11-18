@@ -322,6 +322,9 @@ class TestQSANVFP4FP8Scratch(CustomTestCase):
         err = (pk.float() * descale - true).abs()
         self.assertEqual(int(pk.shape[0]), 125)
         self.assertTrue(bool((err <= true.abs() * 2**-3 + descale * 2**-8).all()))
+        true_v = reference_dequant(self.v, self.v_sf, self.g)[slots]
+        err_v = (pv.float() * descale - true_v).abs()
+        self.assertTrue(bool((err_v <= true_v.abs() * 2**-3 + descale * 2**-8).all()))
 
 
 class TestQSANVFP4Recipe(CustomTestCase):

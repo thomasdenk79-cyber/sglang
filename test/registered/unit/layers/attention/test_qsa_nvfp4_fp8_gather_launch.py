@@ -99,6 +99,7 @@ class TestScratchModeAndGate(CustomTestCase):
         self.assertEqual(float(k_d), 0.0)
 
     def _hook_warning(self, scratch):
+        import os
         from unittest import mock
 
         from sglang.srt.arg_groups import kv_cache_hook as hook
@@ -111,8 +112,6 @@ class TestScratchModeAndGate(CustomTestCase):
             enable_unified_cache_external_linker=False,
             enable_hierarchical_cache=False,
         )
-        import os
-
         with mock.patch.dict(
             os.environ,
             {
