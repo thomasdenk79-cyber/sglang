@@ -359,6 +359,19 @@ class SchedulerMetricsReporter:
             enable_metrics=self.enable_metrics
         )
 
+    _draft_vocab_coverage: float = -1.0
+
+    def _draft_vocab_log_suffix(self) -> str:
+        """Dynamic draft vocab coverage since the last decode log (no sync)."""
+        outer = self.scheduler.draft_worker
+        inner = getattr(outer, "draft_worker", None)
+        dv = getattr(inner, "dynamic_vocab", None)
+        if dv is None or not dv.config.metrics:
+            return ""
+        suffix = dv.log_suffix()
+        self._draft_vocab_coverage = dv.last_coverage
+        return suffix
+
     def _install_device_timer_on_runners(self):
         if self.forward_pass_device_timer is None:
             return
@@ -997,6 +1010,9 @@ class SchedulerMetricsReporter:
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            draft_vocab_msg = self._draft_vocab_log_suffix()
+            if draft_vocab_msg:
+                msg += f"{draft_vocab_msg}, "
             if spec_cap_length > 0:
                 msg += f"cap len: {spec_cap_length:.2f}, "
             if spec_block_accept_length > 0:
@@ -1083,6 +1099,7 @@ class SchedulerMetricsReporter:
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length
             self.stats.spec_accept_rate = spec_accept_rate
+            self.stats.spec_draft_vocab_coverage = self._draft_vocab_coverage
             self.stats.spec_cap_length = spec_cap_length
             self.stats.spec_block_accept_length = spec_block_accept_length
             self.stats.spec_num_steps = spec_num_steps
