@@ -2114,6 +2114,9 @@ class PrefillAdder:
 
         max_new = self._swa_new_tokens(req)
         total_tokens, state_slots = self._prefill_charge(req)
+        # A streamed staged hit already holds its device rows.
+        streamed_tokens = self._streamed_device_tokens(req)
+        total_tokens -= streamed_tokens
         if not self.memory_budget.state_slots_fit(state_slots):
             if (
                 isinstance(self.tree_cache, UnifiedRadixCache)
@@ -2133,6 +2136,7 @@ class PrefillAdder:
                 window_host_hit_lengths=req.window_host_hit_lengths,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
+                streamed_tokens=streamed_tokens,
             )
             if isinstance(admission, AddReqResult):
                 if admission is AddReqResult.NO_TOKEN:
@@ -2173,7 +2177,7 @@ class PrefillAdder:
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):
-                    full_load_tokens = req.host_hit_length
+                    full_load_tokens = req.host_hit_length - streamed_tokens
                     if (
                         self.memory_budget.load_back_needs_full_tokens
                         and isinstance(self.tree_cache, UnifiedRadixCache)
@@ -2253,7 +2257,7 @@ class PrefillAdder:
                     # No FULL was loaded; recomputation may no longer fit.
                     admission = self._select_prefill_admission(
                         req,
-                        total_tokens=total_tokens,
+                        total_tokens=total_tokens + streamed_tokens,
                         state_slots=state_slots,
                         host_hit_length=0,
                         window_host_hit_lengths={},
@@ -2285,6 +2289,16 @@ class PrefillAdder:
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
 
+    def _streamed_device_tokens(self, req: Req) -> int:
+        if not envs.SGLANG_HICACHE_BUFFER_STREAM.get() or not isinstance(
+            self.tree_cache, UnifiedRadixCache
+        ):
+            return 0
+        pipeline = self.tree_cache.buffer_pipeline
+        if pipeline is None or not req.host_hit_length:
+            return 0
+        return min(pipeline.streamed_device_tokens(req), req.host_hit_length)
+
     def _prefill_charge(self, req: Req) -> tuple[int, int]:
         """The total tokens and state slots `add_one_req` prices ``req`` at."""
         # Reserve page_size for page-alignment overhead: the paged allocator may
@@ -2311,8 +2325,10 @@ class PrefillAdder:
         truncation_align_size: Optional[int],
         has_chunked_req: bool = False,
         state_slots: int = 0,
+        streamed_tokens: int = 0,
     ) -> _PrefillAdmission | AddReqResult:
-        """Select a prefill shape without allocating or publishing cached KV."""
+        """Select a prefill shape without allocating or publishing cached KV.
+        ``streamed_tokens`` of the host hit already hold device rows."""
         prefix_len = req.prefix_len + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
@@ -2337,7 +2353,7 @@ class PrefillAdder:
             # The cut below lands on this alignment: no admitted limit is
             # below it, so a request is never cut to an empty chunk.
             chunk_align=truncation_align_size,
-            host_hit_tokens=host_hit_length,
+            host_hit_tokens=host_hit_length - streamed_tokens,
         )
         if not can_admit:
             return self._refused()
