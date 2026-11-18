@@ -135,6 +135,53 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
 
 
+def _qsa_nvfp4_pool():
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        QSANVFP4KVCacheMethod,
+    )
+
+    method = QSANVFP4KVCacheMethod(num_layers=1, device="cpu", page_size=16)
+    return SimpleNamespace(full_kv_pool=SimpleNamespace(quant_method=method))
+
+
+def _nvfp4_target_worker(monkeypatch, draft_count):
+    worker, target, runners = _worker(
+        monkeypatch,
+        SimpleNamespace(num_nextn_predict_layers=draft_count),
+        None,
+        (None,) * draft_count,
+    )
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
+        ),
+    )
+    target.token_to_kv_pool = _qsa_nvfp4_pool()
+    return worker, target, runners
+
+
+def test_nvfp4_target_mirrors_draft_in_sidecar(monkeypatch):
+    """Packed MTP would share host rows that lack the target's scale sidecars."""
+    worker, target, runners = _nvfp4_target_worker(monkeypatch, 1)
+    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+    assert plan.mode == spec.HiCacheDraftMode.SIDECAR
+    assert plan.device_pools == (runners[0].token_to_kv_pool,)
+    assert target.mtp_draft_device_pools == ()
+
+
+def test_nvfp4_hicache_draft_fails_closed(monkeypatch):
+    worker, _, _ = _nvfp4_target_worker(monkeypatch, 2)
+    with pytest.raises(NotImplementedError, match="one draft KV pool"):
+        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+    worker, _, runners = _nvfp4_target_worker(monkeypatch, 1)
+    runners[0].token_to_kv_pool = _qsa_nvfp4_pool()
+    with pytest.raises(NotImplementedError, match="NVFP4 draft KV"):
+        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
 def _dsa_draft_worker(monkeypatch, *, nextn_layers, dcp_replicated, dcp_size=4):
     monkeypatch.setattr(
         spec, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=dcp_size)
