@@ -1488,6 +1488,11 @@ class Envs:
     # NVFP4 GEMV (layers/moe/draft_moe_gemv.py) instead of FlashInfer CUTLASS.
     # Draft numerics only; sm_120, EP/TP 1, gated silu layers without limits.
     SGLANG_OPT_DRAFT_MOE_GEMV = EnvBool(False)
+    # Opt-in: the MoE router gate of a Qwen MoE block runs a Triton GEMV at
+    # 1..16 rows instead of the cuBLAS GEMM the ReplicatedLinear issues
+    # (layers/moe/router_gemv.py). Bias-free gates keep BF16 logits through the
+    # in-tree skinny GEMV; a gate with a bias gets FP32 logits.
+    SGLANG_ROUTER_GEMV = EnvBool(False)
     # Lossy, opt-in: drop small-batch MoE routes that are the only route to
     # their expert in the call and weigh less than TAU, saving that expert's
     # weight read. 0 disables. MIN_RANK keeps each row's top routes, MIN_ROWS

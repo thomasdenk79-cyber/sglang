@@ -390,6 +390,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        # SGLANG_ROUTER_GEMV: at decode widths the gate is a [num_experts,
+        # hidden] BF16 GEMV over 1..16 rows, which cuBLAS serves with a padded
+        # MMA tile. Resolved once here so a forward only reads a bool.
+        self._router_gemv_enabled = bool(
+            envs.SGLANG_ROUTER_GEMV.get()
+            and _is_cuda
+            and config.model_type in ("qwen4_exp_text", "qwen3_5_moe_text")
+        )
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -626,7 +634,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._forward_router_logits(hidden_states)
             if enable_dual_stream:
                 from sglang.srt.hardware_backend.npu.cmo import (
                     shared_expert_on_independent_stream,
@@ -692,7 +700,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_ids = None
         topk_weights = None
         if num_tokens > 0:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._forward_router_logits(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -729,6 +737,56 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def _forward_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``self.gate(hidden_states)``, on the decode GEMV when that applies.
+
+        The gate of this model family is a bias-free BF16 ``ReplicatedLinear``,
+        so the path taken is the tuned in-tree split-K skinny GEMV, which
+        returns BF16 logits exactly like ``ReplicatedLinear`` does. A gate that
+        does carry a bias goes to ``layers/moe/router_gemv.py``, the donor's
+        FP32-logit kernel. Anything the guards reject falls through to the
+        ``ReplicatedLinear`` unchanged.
+        """
+        weight = getattr(self.gate, "weight", None)
+        bias = getattr(self.gate, "bias", None)
+        if (
+            self._router_gemv_enabled
+            and weight is not None
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.shape[0] <= 16
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.shape[1] % 128 == 0
+            and weight.shape == (weight.shape[0], hidden_states.shape[1])
+            and weight.shape[0] % 32 == 0
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (
+                bias is None or (bias.dtype == torch.bfloat16 and bias.is_contiguous())
+            )
+        ):
+            if bias is None:
+                from sglang.kernels.ops.gemm.sm120_bf16_skinny_gemv import (
+                    bf16_skinny_gemv_applies,
+                    bf16_skinny_linear,
+                    is_sm120,
+                )
+
+                if is_sm120() and bf16_skinny_gemv_applies(hidden_states, weight):
+                    logits = bf16_skinny_linear(hidden_states, weight)
+                    if logits is not None:
+                        return logits
+            else:
+                from sglang.srt.layers.moe.router_gemv import (
+                    router_gemv,
+                    router_gemv_applies,
+                )
+
+                if router_gemv_applies(hidden_states, weight, bias):
+                    return router_gemv(hidden_states, weight, bias)
+        router_logits, _ = self.gate(hidden_states)
+        return router_logits
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -740,7 +798,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if topk_output is not None:
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._forward_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
