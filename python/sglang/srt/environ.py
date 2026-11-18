@@ -1522,6 +1522,13 @@ class Envs:
     # read the selected KV straight from the pool in a split-K CUDA kernel
     # instead of packing it into a bf16 scratch for FlashInfer's trtllm decode.
     SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA = EnvBool(False)
+    # NVFP4 QSA KV: dtype of the scratch the dequantizing gathers write.  fp8
+    # (default) stores value / (6 * global_scale) -- E2M1_MAX * block_scale / 6
+    # never exceeds the E4M3 range -- so the scratch matches the FP8-cache
+    # layout and the split-K decode can run on it; the kernels undo the descale
+    # like an FP8 pool's k_scale/v_scale.  bf16 = legacy behaviour: the scratch
+    # keeps the true value (no descale) at double the bytes.
+    SGLANG_QSA_NVFP4_SCRATCH = EnvStr("fp8")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

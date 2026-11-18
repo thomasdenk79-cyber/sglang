@@ -275,6 +275,44 @@ def pack_qsa_prefill_kv_nvfp4(
     )
 
 
+# ---------------------------------------------------------------------------
+# FP8 scratch recipe
+# ---------------------------------------------------------------------------
+# A dequantized row ``e2m1 * block_scale * global_scale`` overflows the E4M3
+# range (448) whenever the calibrated global scale is large, which is why the
+# gathers historically dequantized into a BF16 scratch.  Dividing by the
+# per-layer *descale* ``6 * global_scale`` keeps the stored value inside the
+# E4M3 range provably -- ``|e2m1 * block_scale| / 6 <= 6 * 448 / 6 == 448`` --
+# and the downstream kernels undo it exactly like an FP8 KV pool's
+# k_scale/v_scale: the true value is ``stored * descale``.
+# The same two constants exist as literals in layers/quantization/
+# kvfp4_tensor.py (that file keeps constants as literals by convention); a
+# unit test pins the two definitions equal.
+E2M1_MAX = 6.0
+FP8_E4M3_MAX = 448.0
+
+
+def nvfp4_fp8_descale(global_scale: torch.Tensor) -> torch.Tensor:
+    """E4M3-scratch descale for one K/V global scale: value = stored * descale.
+
+    Returns a 0-dim fp32 tensor so bf16 consumers multiply without dtype
+    promotion; CUDA-graph safe (derived from the method's device tensor).
+    """
+    return (global_scale * E2M1_MAX).reshape(())
+
+
+def nvfp4_fp8_gather_scale(global_scale: torch.Tensor) -> torch.Tensor:
+    """The global scale the gather kernel must apply for an FP8 (descaled) scratch.
+
+    ``g / (E2M1_MAX * g)`` reproduces ``1 / E2M1_MAX`` up to one fp32 ulp; it
+    stays a [1] device tensor so a captured gather reads it on replay. A zero
+    (uninitialized) global scale maps to a zero gather scale, matching the
+    plain dequant's all-zero output instead of producing NaN.
+    """
+    descale = global_scale * E2M1_MAX
+    return torch.where(descale == 0, torch.zeros_like(descale), global_scale / descale)
+
+
 def reference_dequant(data, sf, g, out_dtype=torch.float32):
     """Independent PyTorch reference:
     ``[m, heads, dim/2]`` + ``[m, heads, dim/16]`` -> ``[m, heads, dim]``."""
@@ -295,6 +333,10 @@ def reference_dequant(data, sf, g, out_dtype=torch.float32):
 
 
 __all__ = [
+    "E2M1_MAX",
+    "FP8_E4M3_MAX",
+    "nvfp4_fp8_descale",
+    "nvfp4_fp8_gather_scale",
     "nvfp4_gather_dequant",
     "pack_qsa_prefill_kv_nvfp4",
     "qwen_sparse_kv_extraction_compact_nvfp4_triton",
