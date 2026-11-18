@@ -103,15 +103,16 @@ MAX_M = 32
 #: Widest M the tile tables were measured at, and the value
 #: SGLANG_MXFP8_SKINNY_GEMV_MAX_M is clamped to: 17..32 would ride the M=16
 #: tiles with a BLOCK_M of 32, which nothing has measured, so the hook does not
-#: serve it (a direct caller still can, and gets correct -- just untuned)
-#: results).
+#: serve it. A direct caller still can, and gets correct but untuned results.
 MAX_TUNED_M = 16
 
 #: Absolute sanity bound on a direct call: above it the caller means a GEMM.
 _ENTRY_MAX_M = 1024
 
-#: Split-K scratch, allocated once per (device, stream) and reused: the fixup
-#: CTA leaves the counters at 0, so nothing has to be cleared between calls.
+#: Split-K scratch, allocated once per (device, stream) and reused. The fixup
+#: CTA resets the counters with an atomic exchange, so a replayed graph needs no
+#: memset; an eager launch still clears them first, because a launch aborted
+#: mid-kernel would otherwise poison that N block forever (_clear_counters).
 #: Sized for the largest plan _plan can emit (_fit caps the product).
 _WS_FLOATS = 1 << 21
 _WS_COUNTERS = 4096
