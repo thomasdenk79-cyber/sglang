@@ -18,6 +18,9 @@
 ``W`` is the server's MXFP8 layout: ``float8_e4m3fn`` [N, K] row-major with one
 UE8M0 (power-of-two) scale byte per 32 contiguous K elements in
 ``weight_scale_inv`` [N, K // 32]; the scale of (n, k) is ``2 ** (e - 127)``.
+The gate demands the full row-major layout (``stride(0) == K``,
+``stride(1) == 1``): the kernel indexes ``w_ptr + n * K`` and a sliced view of
+a wider tensor would silently read the wrong rows.
 
 Why this exists: the GDN block normalises its attention output per
 (token, v-head) -- ``RMSNormGated(head_v_dim, norm_before_gate=True)``, i.e.
@@ -394,7 +397,12 @@ def fused_norm_gemv_applies(
         and norm_weight.dtype in (torch.bfloat16, torch.float32)
         and weight.dtype == torch.float8_e4m3fn
         and weight.shape == (N, K)
+        # The kernel indexes w_ptr + offs_n * K, ignoring strides: an [N, K]
+        # view of a wider row-major tensor would pass a stride(1) == 1-only
+        # check and silently read the wrong rows. Demand the full row-major
+        # layout the kernel assumes.
         and weight.stride(1) == 1
+        and weight.stride(0) == K
         and scale.dtype == torch.uint8
         and scale.shape == (N, K // GROUP_K)
         and scale.is_contiguous()

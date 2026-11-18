@@ -344,6 +344,23 @@ def test_gate_rejects_too_many_rows():
     assert not _applies(x, z, norm_w, w, scale)
 
 
+def test_gate_rejects_sliced_weight_view():
+    # [N, K] view of a wider row-major tensor: stride(1) == 1 but
+    # stride(0) != K, and the kernel indexes w_ptr + n * K, so accepting it
+    # would silently read the wrong rows (the torch reference would raise).
+    x, z, norm_w, _, scale = _good()
+    wide = (torch.randn(N_REAL, K_REAL + 32) * 0.05).clamp(-448.0, 448.0)
+    wide = wide.to(torch.float8_e4m3fn)
+    w = wide[:, :K_REAL]
+    assert w.stride(1) == 1 and w.stride(0) != K_REAL  # the hazard shape
+    assert not _applies(x, z, norm_w, w, scale), (
+        "a sliced fp8 weight view with row stride != K must fall through "
+        "to the unfused path"
+    )
+    # Positive control: the same data fully contiguous is still accepted.
+    assert _applies(x, z, norm_w, wide[:, :K_REAL].contiguous(), scale)
+
+
 def test_gate_rejects_unsupported_activation_and_group():
     x, z, norm_w, w, scale = _good()
     assert not _applies(x, z, norm_w, w, scale, activation="gelu")
