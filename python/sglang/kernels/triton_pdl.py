@@ -135,15 +135,15 @@ def _fresh_platform_snapshot() -> PlatformInfo:
 def _probe_pdl_support() -> Optional[bool]:
     """Ask the platform once; ``None`` means "unknown -- retry next launch".
 
-    The tree's ``is_arch_support_pdl`` is ``cache_once``'d and ``current_arch``
-    caches its arch object, so either can latch a pre-device CPU verdict (a
-    parent process probed before its TP/DP workers selected a device) as
-    ``False`` for the life of the process -- that would let a flag-on arm
-    decode all night silently without PDL (review3 B2). Conclusiveness
-    therefore comes from a fresh ``PlatformInfo`` snapshot: with CUDA selected,
-    ask the arch directly (it reads the live device, no cached layer); with a
-    foreign accelerator ``False`` is definitive; with the default CPU snapshot
-    a ``False`` is only missing information, so the probe stays retryable.
+    The verdict comes from a fresh ``PlatformInfo`` snapshot and nothing
+    else: ``is_arch_support_pdl`` is ``cache_once``'d and ``current_arch``
+    memoises into ``arch._DEVICE_ARCH``, so consulting either before a CUDA
+    device is selected would pin the pre-device answer for the life of the
+    process -- and is the only way this probe could corrupt the package-wide
+    arch cache that later CUDA workers read. With CUDA selected, ask the arch
+    directly (it reads the live device, no cached layer); with a foreign
+    accelerator ``False`` is definitive; with the default CPU snapshot a
+    ``False`` is only missing information, so the probe stays retryable.
     """
     global _PDL_PROBE_REASON
     try:
@@ -154,18 +154,13 @@ def _probe_pdl_support() -> Optional[bool]:
             answer = CudaArch().supports_pdl
             _PDL_PROBE_REASON = "cuda capability verdict on the selected device"
             return answer
-        from sglang.kernels.jit.utils import is_arch_support_pdl
-
-        answer = bool(is_arch_support_pdl())
-        if not answer and p.device_type not in _FOREIGN_ACCELERATORS:
-            _PDL_PROBE_REASON = (
-                f"platform {p.device_type!r} has no CUDA device selected yet"
-            )
-            return None
+        if p.device_type in _FOREIGN_ACCELERATORS:
+            _PDL_PROBE_REASON = f"platform {p.device_type!r} cannot host a PDL launch"
+            return False
         _PDL_PROBE_REASON = (
-            "foreign-accelerator verdict" if answer is False else "device verdict"
+            f"platform {p.device_type!r} has no CUDA device selected yet"
         )
-        return answer
+        return None
     except Exception as exc:
         _PDL_PROBE_REASON = f"{type(exc).__name__}: {exc}"
         return None

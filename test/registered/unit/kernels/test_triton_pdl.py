@@ -141,17 +141,18 @@ def test_pdl_enabled_requires_flag_and_device(monkeypatch):
 
 
 def test_pdl_device_probe_never_raises(monkeypatch):
-    """A driver failure in the tree-wide predicate must not escape a launch."""
-    import sglang.kernels.jit.utils as jit_utils
+    """A driver failure on the CUDA probe path must not escape a launch."""
 
-    def boom() -> bool:
+    def boom_arch():
         raise RuntimeError("no driver")
 
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
-    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", boom)
+    _fake_platform(monkeypatch, "cuda")
+    monkeypatch.setattr("sglang.kernels.arch._cuda.CudaArch", boom_arch)
     triton_pdl._reset_pdl_device_gate()
     try:
         assert triton_pdl.triton_pdl_enabled() is False
+        assert "RuntimeError" in triton_pdl._PDL_PROBE_REASON
     finally:
         triton_pdl._reset_pdl_device_gate()
 
@@ -163,25 +164,27 @@ def test_pdl_device_probe_is_not_sticky_after_a_failure(monkeypatch):
     answer were cached, a ``SGLANG_TRITON_PDL=1`` arm would decode all night
     with the feature silently off.
     """
-    import sglang.kernels.jit.utils as jit_utils
-
     state = {"raises": True}
+    calls = {"n": 0}
 
-    def predicate() -> bool:
+    def arch():
+        calls["n"] += 1
         if state["raises"]:
             raise RuntimeError("driver not ready")
-        return True
+        return types.SimpleNamespace(supports_pdl=True)
 
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
-    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", predicate)
+    _fake_platform(monkeypatch, "cuda")
+    monkeypatch.setattr("sglang.kernels.arch._cuda.CudaArch", arch)
     triton_pdl._reset_pdl_device_gate()
     try:
         assert triton_pdl.triton_pdl_enabled() is False
         state["raises"] = False
         assert triton_pdl.triton_pdl_enabled() is True
-        # A definitive answer is cached: the predicate is not consulted again.
+        # A definitive answer is cached: the arch is not probed again.
         state["raises"] = True
         assert triton_pdl.triton_pdl_enabled() is True
+        assert calls["n"] == 2
     finally:
         triton_pdl._reset_pdl_device_gate()
 
@@ -408,7 +411,7 @@ def test_instrumented_sites_launch_kwargs(monkeypatch, site, enabled):
     kwargs = _recorded_launch(monkeypatch, site, enabled).kwargs
     if site == "sigmoid-mul":
         # arch is patched on here, so the pre-existing half must stay lit
-        # whichever way the flag goes (review3 codex B4).
+        # whichever way the flag goes.
         assert kwargs["USE_PDL"] is True
         assert kwargs["launch_pdl"] is True
         assert kwargs["GDC_TRIGGER"] is enabled
@@ -489,20 +492,26 @@ def test_cpu_snapshot_false_is_retryable_not_a_verdict(monkeypatch):
     """A pre-device CPU probe must not latch PDL off for the process lifetime.
 
     detect() returns the "cpu" default whenever no CUDA device is visible
-    yet, so a False predicate there is missing information; a flag-on worker
+    yet, so that snapshot carries no device information; a flag-on worker
     that probes too early must light up on the next instrumented launch
     instead of decoding all night silently without PDL.
     """
     import sglang.kernels.jit.utils as jit_utils
 
-    state = {"ok": False}
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
     _fake_platform(monkeypatch, "cpu")
-    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", lambda: state["ok"])
+    # A supporting answer from the caching helper: if the probe ever
+    # consults it instead of the snapshot, the cpu snapshot must not turn
+    # into a PDL verdict.
+    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", lambda: True)
     triton_pdl._reset_pdl_device_gate()
     try:
         assert triton_pdl.triton_pdl_enabled() is False
-        state["ok"] = True
+        _fake_platform(monkeypatch, "cuda")
+        monkeypatch.setattr(
+            "sglang.kernels.arch._cuda.CudaArch",
+            lambda: types.SimpleNamespace(supports_pdl=True),
+        )
         assert triton_pdl.triton_pdl_enabled() is True
     finally:
         triton_pdl._reset_pdl_device_gate()
@@ -516,7 +525,7 @@ def test_foreign_accelerator_false_is_a_cached_verdict(monkeypatch):
 
     def predicate() -> bool:
         calls["n"] += 1
-        return False
+        return True
 
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
     _fake_platform(monkeypatch, "hip")
@@ -525,7 +534,9 @@ def test_foreign_accelerator_false_is_a_cached_verdict(monkeypatch):
     try:
         assert triton_pdl.triton_pdl_enabled() is False
         assert triton_pdl.triton_pdl_enabled() is False
-        assert calls["n"] == 1
+        # The snapshot alone says no CUDA PDL launch can happen here; the
+        # caching helper must not be asked for an answer it would latch.
+        assert calls["n"] == 0
     finally:
         triton_pdl._reset_pdl_device_gate()
 
@@ -554,12 +565,8 @@ def test_first_resolved_verdict_is_logged_once(monkeypatch, caplog):
 
 def test_undecided_gate_warns_once_then_lights_up(monkeypatch, caplog):
     """Operators of a flag-on arm learn about an undecided gate exactly once."""
-    import sglang.kernels.jit.utils as jit_utils
-
-    state = {"ok": False}
     monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
     _fake_platform(monkeypatch, "cpu")
-    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", lambda: state["ok"])
     triton_pdl._reset_pdl_device_gate()
     caplog.set_level(logging.WARNING, logger="sglang.kernels.triton_pdl")
     try:
@@ -567,7 +574,11 @@ def test_undecided_gate_warns_once_then_lights_up(monkeypatch, caplog):
         assert triton_pdl.triton_pdl_enabled() is False
         warns = [r for r in caplog.records if "undecided" in r.getMessage()]
         assert len(warns) == 1
-        state["ok"] = True
+        _fake_platform(monkeypatch, "cuda")
+        monkeypatch.setattr(
+            "sglang.kernels.arch._cuda.CudaArch",
+            lambda: types.SimpleNamespace(supports_pdl=True),
+        )
         assert triton_pdl.triton_pdl_enabled() is True
     finally:
         triton_pdl._reset_pdl_device_gate()
@@ -592,6 +603,37 @@ def test_platform_probe_leaves_the_shared_platform_cache_untouched(monkeypatch):
     try:
         triton_pdl.triton_pdl_enabled()
         assert kernel_spec._DETECTED_PLATFORM is sentinel
+    finally:
+        triton_pdl._reset_pdl_device_gate()
+
+
+def test_pre_device_probe_never_latches_the_arch_cache(monkeypatch):
+    """The probe must not freeze sglang.kernels.arch for later CUDA workers.
+
+    current_arch() memoises into arch._DEVICE_ARCH on first call and the
+    cache_once'd is_arch_support_pdl routes through it: a probe consulting
+    either while no CUDA device is selected pins a plain DeviceArch for the
+    life of the process, so every worker forked afterwards would launch
+    without PDL even on a sm90 GPU.
+    """
+    import sglang.kernels.arch as kernel_arch
+    import sglang.kernels.jit.utils as jit_utils
+
+    calls = {"n": 0}
+
+    def predicate() -> bool:
+        calls["n"] += 1
+        return False
+
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    _fake_platform(monkeypatch, "cpu")
+    monkeypatch.setattr(jit_utils, "is_arch_support_pdl", predicate)
+    monkeypatch.setattr(kernel_arch, "_DEVICE_ARCH", None)
+    triton_pdl._reset_pdl_device_gate()
+    try:
+        assert triton_pdl.triton_pdl_enabled() is False
+        assert calls["n"] == 0
+        assert kernel_arch._DEVICE_ARCH is None
     finally:
         triton_pdl._reset_pdl_device_gate()
 
