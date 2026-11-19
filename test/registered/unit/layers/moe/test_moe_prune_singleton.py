@@ -151,6 +151,38 @@ def test_kernel_matches_reference_bitwise_with_pdl_off():
         assert torch.equal(kw, ref_w), (kw, ref_w)
 
 
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
+)
+def test_histogram_scratch_is_left_zeroed_after_launch():
+    """The histogram scratch is a cached, reused buffer, so the kernel must
+    hand it back zeroed: one stale count would mis-classify the next batch's
+    singletons (a pruned route stays unpruned, or vice versa).
+    """
+    ids0 = torch.tensor([[7, 3, 4], [7, 5, 9]], dtype=torch.int32)
+    w0 = torch.tensor([[0.60, 0.35, 0.05], [0.50, 0.42, 0.08]])
+    cfg = _cfg(tau=0.08)
+    results = []
+    for _ in range(2):
+        ids, w = ids0.clone(), w0.clone()
+        cnt = torch.zeros(8, dtype=torch.int32)
+        ps._launch_prune_kernel_(
+            topk_ids=ids,
+            topk_weights=w,
+            cnt=cnt,
+            m=2,
+            k=3,
+            num_expert_slots=8,
+            num_shared_cols=0,
+            cfg=cfg,
+        )
+        assert torch.count_nonzero(cnt) == 0, cnt.tolist()
+        results.append((ids.tolist(), w.tolist()))
+    assert results[0][0] == [[7, 3, -1], [7, 5, 9]]
+    assert results[0] == results[1], "a reused scratch changed the prune decision"
+
+
 def test_padded_rows_are_ignored_and_not_counted():
     ids = torch.tensor([[7, 3], [-1, -1], [5, 9]], dtype=torch.int32)
     w = torch.tensor([[0.9, 0.05], [0.0, 0.0], [0.9, 0.05]])

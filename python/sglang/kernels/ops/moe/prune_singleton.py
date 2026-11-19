@@ -364,7 +364,10 @@ def maybe_prune_singleton_routes_(
         if cfg.renorm
         else None
     )
-    # Per stream, so launches on different streams never share counters.
+    # Keyed by (device, stream handle, slots): the kernel adds, reads and
+    # re-zeroes its counters inside one launch, so a per-stream key keeps that
+    # sequence exclusive to the stream's queue; a launch aborted between add
+    # and reset is the only way stale counts survive into the next launch.
     key = (
         topk_ids.device,
         torch.cuda.current_stream(topk_ids.device).cuda_stream,
