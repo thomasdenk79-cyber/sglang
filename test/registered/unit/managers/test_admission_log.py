@@ -14,7 +14,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # The line the incident parser keys on: one record per admitted request.
 LINE = re.compile(
-    r"^HiCache admission rid=(\S+) prompt=(\d+) device=(\d+) host=(\d+)"
+    r"^HiCache admission req=(\S+) prompt=(\d+) device=(\d+) host=(\d+)"
     r" storage=(\d+) recompute=(\d+) attempts=(\d+) wait_ms=(-?\d+)$"
 )
 LOGGER_NAME = "sglang.srt.managers.schedule_policy"
@@ -137,7 +137,7 @@ class TestAdmissionFormat(unittest.TestCase):
         )
         self.assertEqual(
             format_admission("r1", fields),
-            "HiCache admission rid=r1 prompt=1000 device=500 host=0"
+            "HiCache admission req=r1 prompt=1000 device=500 host=0"
             " storage=100 recompute=400 attempts=2 wait_ms=37",
         )
 

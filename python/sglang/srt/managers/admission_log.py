@@ -39,7 +39,7 @@ def admission_fields(
 def format_admission(rid: Any, fields: Dict[str, int]) -> str:
     """Render one admission record as a single greppable log line."""
     return (
-        f"HiCache admission rid={rid}"
+        f"HiCache admission req={rid}"
         f" prompt={fields['prompt']}"
         f" device={fields['device']}"
         f" host={fields['host']}"
