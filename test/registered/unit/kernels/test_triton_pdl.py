@@ -587,10 +587,11 @@ def test_undecided_gate_warns_once_then_lights_up(monkeypatch, caplog):
 def test_platform_probe_leaves_the_shared_platform_cache_untouched(monkeypatch):
     """A pre-device PDL probe must not publish into the process-wide cache.
 
-    ``detect(use_cache=False)`` re-probes *and* writes ``spec._DETECTED_PLATFORM``,
-    which the rest of the kernels package reads back with ``use_cache=True``; a
-    probe here would republish another component's cached platform as whatever
-    this process happens to see right now.
+    ``detect(use_cache=False)`` is the non-publishing probe path in
+    ``sglang.kernels.spec``, so the snapshot the rest of the kernels package
+    reads back with ``use_cache=True`` survives a PDL probe unchanged: let it
+    republish another component's cached platform as whatever this process
+    happens to see right now and every kernel selector inherits a CPU answer.
     """
     from sglang.kernels import spec as kernel_spec
 
@@ -605,6 +606,77 @@ def test_platform_probe_leaves_the_shared_platform_cache_untouched(monkeypatch):
         assert kernel_spec._DETECTED_PLATFORM is sentinel
     finally:
         triton_pdl._reset_pdl_device_gate()
+
+
+def test_fresh_detect_neither_reads_nor_writes_the_shared_cache(monkeypatch):
+    """``detect(use_cache=False)`` is a probe, not a decision.
+
+    Both halves are load-bearing for the PDL gate, which asks this question on
+    the first launch: the answer must come from the device as it is *now*, not
+    from the snapshot somebody else cached, and it must not become that
+    snapshot for every other reader in the package.
+    """
+    from sglang.kernels import spec as kernel_spec
+
+    cached = kernel_spec.PlatformInfo(device_type="cuda", cuda_arch_major=12)
+    monkeypatch.setattr(kernel_spec, "_DETECTED_PLATFORM", cached)
+    monkeypatch.setattr(
+        kernel_spec.PlatformInfo,
+        "_probe",
+        classmethod(lambda cls: kernel_spec.PlatformInfo(device_type="cpu")),
+    )
+    assert kernel_spec.PlatformInfo.detect(use_cache=False).device_type == "cpu"
+    assert kernel_spec._DETECTED_PLATFORM is cached
+    assert kernel_spec.PlatformInfo.detect() is cached
+
+
+def test_fresh_probe_never_publishes_a_transient_snapshot(monkeypatch):
+    """No other thread may see the probe's snapshot, not even for an instant.
+
+    The save/restore this replaced looked symmetric and was not: between
+    ``detect(use_cache=False)`` returning and the ``finally`` putting the old
+    snapshot back, every other thread's ``detect()`` read back this thread's
+    pre-device answer. A two-thread stress hits that window only by luck, so
+    the interleaving is reproduced deterministically: the watcher below samples
+    the shared snapshot at the moment the real ``detect`` has returned and the
+    caller has not restored -- exactly where a racing reader lands. The probe
+    counter is the other half of the proof: without it, a gate that quietly
+    answered from the stale cache instead of probing would sail through every
+    visibility assertion above.
+    """
+    from sglang.kernels import spec as kernel_spec
+
+    cached = kernel_spec.PlatformInfo(
+        device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0
+    )
+    seen = []
+    probes = []
+
+    def fake_probe(cls):
+        probes.append(1)
+        return kernel_spec.PlatformInfo(device_type="cpu")
+
+    class _WindowWatcher:
+        @staticmethod
+        def detect(*, use_cache=True):
+            answer = kernel_spec.PlatformInfo.detect(use_cache=use_cache)
+            seen.append(kernel_spec._DETECTED_PLATFORM)
+            return answer
+
+    monkeypatch.setattr(kernel_spec, "_DETECTED_PLATFORM", cached)
+    monkeypatch.setattr(kernel_spec.PlatformInfo, "_probe", classmethod(fake_probe))
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    monkeypatch.setattr(triton_pdl, "PlatformInfo", _WindowWatcher)
+    triton_pdl._reset_pdl_device_gate()
+    try:
+        assert triton_pdl._device_supports_pdl() is False  # cpu default: retry
+    finally:
+        triton_pdl._reset_pdl_device_gate()
+    # The probe really did look at the device (a cached answer would silently
+    # pass the two assertions below), and nothing transient became visible.
+    assert probes == [1], probes
+    assert seen == [cached], seen
+    assert kernel_spec._DETECTED_PLATFORM is cached
 
 
 def test_pre_device_probe_never_latches_the_arch_cache(monkeypatch):
@@ -665,8 +737,10 @@ def test_gemv_fused_norm_requires_pdl_off(monkeypatch):
 # --------------------------------------------------------------------------
 # CPU PTX proof: the griddepcontrol instructions are a compile-time
 # consequence of the single flag read, taken off the host's real launch call.
-# This is what licenses the value-transparency claim for the gpuq PDL arms,
-# which share their HiCache namespace with their flag-off twins.
+# This is the backstop for the gpuq PDL arms: the launcher hashes TRITON_PDL
+# into the HiCache store name, so an arm's twins do NOT share a namespace --
+# and what this proof licenses is the weaker claim that even a shared or
+# reused store could not make them read each other's values.
 # --------------------------------------------------------------------------
 
 needs_jit_mode = pytest.mark.skipif(
@@ -739,7 +813,11 @@ def test_instrumented_ptx_griddepcontrol_follows_the_flag(monkeypatch, site, ena
 
     The generated PTX, not just the launch kwargs, must follow the single
     flag read: a stray wait with the flag off changes stream semantics for
-    every consumer of the compiled kernel cache.
+    every consumer of the compiled kernel cache. It is also the value-safety
+    argument for the queue's PDL arms -- they are namespace-separated by the
+    hashed ``TRITON_PDL`` knob, and because the flag adds only the two gdc
+    instructions, a store ever shared or reused across the flag could still
+    not carry values one arm wrote and the other read.
     """
     if site == "prune":
         fn = ps._kernel()

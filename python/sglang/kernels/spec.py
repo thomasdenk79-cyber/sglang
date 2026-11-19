@@ -103,9 +103,19 @@ class PlatformInfo(msgspec.Struct, frozen=True):
 
         Never raises: if no accelerator is visible the default CPU platform is
         returned. Do not call at import time: probing initializes CUDA.
+
+        ``use_cache=False`` is the *non-publishing* probe: it builds a fresh
+        snapshot and never writes it to the process-wide state below. Probing is
+        how the platform is learned, not how it is decided -- a caller that asks
+        before device selection would otherwise publish a CPU-default snapshot
+        that every cached reader then inherits for the life of the process,
+        silently picking CPU fallbacks throughout the package. Callers that only
+        want a one-shot answer use this path; everyone else wants the default.
         """
         global _DETECTED_PLATFORM
-        if _DETECTED_PLATFORM is None or not use_cache:
+        if not use_cache:
+            return cls._probe()
+        if _DETECTED_PLATFORM is None:
             _DETECTED_PLATFORM = cls._probe()
         return _DETECTED_PLATFORM
 

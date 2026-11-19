@@ -113,25 +113,6 @@ _FOREIGN_ACCELERATORS = frozenset(
 )
 
 
-def _fresh_platform_snapshot() -> PlatformInfo:
-    """Probe the platform without publishing into the process-wide cache.
-
-    ``PlatformInfo.detect(use_cache=False)`` re-probes *and* assigns
-    ``spec._DETECTED_PLATFORM``, so the fresh snapshot a pre-device probe needs
-    would also replace the cached platform that the rest of the kernels package
-    reads back with ``use_cache=True``: a CPU-only probe here could leave a
-    CUDA worker believing it runs on CPU. Save and restore keeps ``detect()`` as
-    the single entry point and leaves the global exactly as found.
-    """
-    from sglang.kernels import spec as kernel_spec
-
-    saved = kernel_spec._DETECTED_PLATFORM
-    try:
-        return PlatformInfo.detect(use_cache=False)
-    finally:
-        kernel_spec._DETECTED_PLATFORM = saved
-
-
 def _probe_pdl_support() -> Optional[bool]:
     """Ask the platform once; ``None`` means "unknown -- retry next launch".
 
@@ -144,10 +125,18 @@ def _probe_pdl_support() -> Optional[bool]:
     directly (it reads the live device, no cached layer); with a foreign
     accelerator ``False`` is definitive; with the default CPU snapshot a
     ``False`` is only missing information, so the probe stays retryable.
+
+    The fresh snapshot must not become the cached one: this runs on the first
+    launch, possibly before device selection, and ``sglang.kernels.selector``
+    and every arch adapter read the cached snapshot for the life of the
+    process.
     """
     global _PDL_PROBE_REASON
     try:
-        p = _fresh_platform_snapshot()
+        # ``use_cache=False`` is spec.py's non-publishing probe path: it answers
+        # this one-shot question without writing the snapshot the rest of the
+        # package caches (see PlatformInfo.detect).
+        p = PlatformInfo.detect(use_cache=False)
         if p.device_type == DeviceType.CUDA.value:
             from sglang.kernels.arch._cuda import CudaArch
 
