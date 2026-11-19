@@ -101,6 +101,56 @@ def test_kernel_leaves_the_routed_top_route_with_a_top_weighted_shared_column():
     assert w[:, 3].tolist() == pytest.approx([0.94, 0.91])
 
 
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
+)
+def test_kernel_matches_reference_bitwise_with_pdl_off():
+    """With the flag off the shipped kernel must give exactly what the
+    un-instrumented reference path gives; the PTX check only proves the codegen
+    differs by the gdc intrinsics.
+    """
+    cases = [
+        (
+            torch.tensor([[7, 3, 4], [7, 5, 9]], dtype=torch.int32),
+            torch.tensor([[0.60, 0.35, 0.05], [0.50, 0.42, 0.08]]),
+            8,
+            0,
+        ),
+        (
+            torch.tensor(_SHARED_TOP_IDS, dtype=torch.int32),
+            torch.tensor(_SHARED_TOP_W),
+            21,
+            1,
+        ),
+    ]
+    for ids0, w0, slots, nshared in cases:
+        cfg = _cfg(tau=0.08)
+        ref_ids, ref_w = ids0.clone(), w0.clone()
+        mask = ps.prune_singleton_mask_reference(
+            ref_ids,
+            ref_w,
+            tau=cfg.tau,
+            min_rows=cfg.min_rows,
+            num_expert_slots=slots,
+            num_shared_cols=nshared,
+        )
+        ps.apply_prune_mask_(ref_ids, ref_w, mask, cfg.keep_ids, cfg.renorm, nshared)
+        kid, kw = ids0.clone(), w0.clone()
+        ps._launch_prune_kernel_(
+            topk_ids=kid,
+            topk_weights=kw,
+            cnt=None,
+            m=kid.shape[0],
+            k=kid.shape[1],
+            num_expert_slots=slots,
+            num_shared_cols=nshared,
+            cfg=cfg,
+        )
+        assert torch.equal(kid, ref_ids), (kid, ref_ids)
+        assert torch.equal(kw, ref_w), (kw, ref_w)
+
+
 def test_padded_rows_are_ignored_and_not_counted():
     ids = torch.tensor([[7, 3], [-1, -1], [5, 9]], dtype=torch.int32)
     w = torch.tensor([[0.9, 0.05], [0.0, 0.0], [0.9, 0.05]])
