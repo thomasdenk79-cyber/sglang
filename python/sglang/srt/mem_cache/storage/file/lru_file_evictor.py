@@ -26,7 +26,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import threading
+import time
 from collections import OrderedDict
 from typing import Any, Callable, Optional, Set, Tuple
 
@@ -51,6 +53,12 @@ def _parse_size_to_bytes(value: Any) -> int:
     except (argparse.ArgumentTypeError, ValueError):
         logger.warning(f"Invalid size {value!r} for HiCacheFile; disabling.")
         return 0
+
+
+# Interrupted HiCacheFile writes leave ``.{uuid4-hex}.tmp`` behind (see
+# HiCacheFile._set_file); the LRU scan only tracks ``.bin``, so those orphans
+# leak forever unless swept. Anchored match keeps unrelated dot-files safe.
+_TMP_FILE_RE = re.compile(r"^\.[0-9a-fA-F]{32}\.tmp$")
 
 
 class LRUFileEvictor:
@@ -86,6 +94,11 @@ class LRUFileEvictor:
         self._lock = threading.Lock()
 
         self._load_config(extra_config or {})
+
+        # Orphaned write-temp files leak whether or not eviction is configured
+        # (the .bin-only scan never counts them), so sweep before the inert
+        # early-return. Age-gated: a live in-flight write is always younger.
+        self._gc_orphan_tmp()
 
         self._eviction_enabled = self.max_size_bytes > 0 or self.min_free_bytes > 0
         if not self._eviction_enabled:
@@ -136,6 +149,14 @@ class LRUFileEvictor:
             self.eviction_ratio = 0.9
         if not (0.0 < self.eviction_ratio <= 1.0):
             self.eviction_ratio = 0.9
+
+        age_raw = _cfg(
+            "tmp_gc_age_seconds", envs.SGLANG_HICACHE_FILE_BACKEND_TMP_GC_AGE_SECONDS
+        )
+        try:
+            self.tmp_gc_age_seconds = max(0, int(float(age_raw)))
+        except (TypeError, ValueError):
+            self.tmp_gc_age_seconds = 3600
 
     @property
     def enabled(self) -> bool:
@@ -277,6 +298,54 @@ class LRUFileEvictor:
         if fs is None:
             return True
         return fs[1] - value_bytes >= self.min_free_bytes
+
+    def _gc_orphan_tmp(self) -> None:
+        """Unlink write-temp files older than the age threshold, one ledger
+        line per removal.
+
+        ``HiCacheFile._set_file`` writes ``.{uuid4-hex}.tmp`` and renames it
+        into place; a crash between the two leaves the orphan. Anything still
+        in flight by any live process is younger than the threshold, so this
+        sweep only ever touches abandoned files. Runs once per evictor
+        construction (backend startup), never on the hot path.
+        """
+        if self.tmp_gc_age_seconds <= 0:
+            return
+        try:
+            names = os.listdir(self.file_path)
+        except FileNotFoundError:
+            return
+        now = time.time()
+        cutoff = now - self.tmp_gc_age_seconds
+        removed, freed = 0, 0
+        for fn in names:
+            if not _TMP_FILE_RE.match(fn):
+                continue
+            fp = os.path.join(self.file_path, fn)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if not os.path.isfile(fp) or st.st_mtime > cutoff:
+                continue
+            try:
+                os.remove(fp)
+            except FileNotFoundError:
+                continue  # another rank's sweep got it first
+            except OSError as exc:
+                logger.warning(f"HiCacheFile tmp-GC: cannot remove {fp}: {exc}")
+                continue
+            removed += 1
+            freed += st.st_size
+            logger.info(
+                f"HiCacheFile tmp-GC ledger: removed {fn} "
+                f"size={st.st_size} B age={now - st.st_mtime:.0f}s"
+            )
+        if removed:
+            logger.info(
+                f"HiCacheFile tmp-GC: {removed} orphan tmp file(s) removed, "
+                f"{freed} B reclaimed (threshold {self.tmp_gc_age_seconds}s)."
+            )
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""

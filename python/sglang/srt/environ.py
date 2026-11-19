@@ -958,6 +958,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    # Seconds an orphaned write-temp file (.{uuid}.tmp) may sit in the store
+    # before startup GC unlinks it; 0 disables the sweep. 3600 keeps live
+    # in-flight writes from other ranks/processes untouched.
+    SGLANG_HICACHE_FILE_BACKEND_TMP_GC_AGE_SECONDS = EnvInt(3600)
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
