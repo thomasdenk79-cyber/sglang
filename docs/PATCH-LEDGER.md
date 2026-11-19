@@ -46,7 +46,8 @@ Remote state of `origin` = `git@github.com:thomasdenk79-cyber/sglang.git` (priva
 
 ## 3. Commit groups — `25c1c439..rc/qwen38-rc2`
 
-Column `n` = commit count (sum over all rows = 155). `Tests` = sum of the register field
+Column `n` = commit count (sum over the `G*` rows = 155 stack commits; the `DOK` row tracks
+documentation-only commits added to the branch after delivery). `Tests` = sum of the register field
 "Tests" (number of test files touched per commit). Evidence `[R] QFN-a..b` = the register rows
 in `/srv/community-repos/qwen38-flashnext-nvfp4-kv/docs/PATCHES.md` (and `patches/register.yaml`)
 for exactly these commits; where additional proof exists it is named with an explicit path.
@@ -76,6 +77,17 @@ Rows without extra proof have GPU state `pending`/`n/a` in the register — trea
 | **G15b** | Upstream NPU/Intel/MUSA package (nightly sync; not our hardware). | is-upstream (merged nightly sync) | #37570, #41496, #41521, #43305, #46029, #49289, #49353, #49481, #49999, #50097, #50117, #50486, #50676, #50725, #50744, #50925, #50969 | 17 | 53 | already in upstream nightly — rebase drops by patch-id | [R] QFN-0011..QFN-0079 | `ba9c86bb7e`, `513e44c89c`, `cc7054723b`, `ced0383482`, `cb08ff1b9d`, `3400b40b34`, `5dd0c10e33`, `fbdad0224a`, `435ee288ed`, `e55e2eeb1f`, `22df117a99`, `eef42710c4`, `5b35f1badb`, `d08d15985b`, `4aef4d60e3`, `9e14a21940`, `2a71304ac5` |
 | **G15c** | Upstream diffusion package (nightly sync; unrelated to the LLM serving path). | is-upstream (merged nightly sync) | #34514, #38766, #49840, #50638, #50640, #50867, #50868, #50960 | 8 | 15 | already in upstream nightly — rebase drops by patch-id | [R] QFN-0001..QFN-0089 | `9d9b45d413`, `8241f8e6f6`, `2e07b70e50`, `8e737da037`, `2d8e3681dc`, `2123631e0e`, `3797ca3b1c`, `d79c53ca37` |
 | **G15d** | Upstream CI/test/chore/doc package (includes suite unification #50874 — large test-inventory churn, low runtime risk). | is-upstream (merged nightly sync) | #40732, #42806, #50815, #50824, #50872, #50874, #50884, #50940, #50994, #51021, #51044 | 11 | 987 | already in upstream nightly — rebase drops by patch-id | [R] QFN-0019..QFN-0084 | `b43c4c00a6`, `31e55a5120`, `b2cc023f23`, `39af8b1211`, `b8555f91bb`, `b2fc126830`, `47dbe1702c`, `ba93265487`, `bb477b230b`, `83c2c71774`, `f534dbaeb2` |
+
+| **DOK** | Documentation-only commits added to `rc/qwen38-rc2` after stack delivery (this ledger itself). Append each new docs commit here; the coverage check pins the stack range below, so docs commits never distort it. | OWN (docs) | - | 1 | 0 | n/a | [O]report-flashnext-rebase-entscheidung.md | `091eaa3a04` |
+
+## 4. Feature branches on top of `rc/qwen38-rc2`
+
+All three branch tips carry `rc/qwen38-rc2` head `1ad48f14e1` as merge-base (verified
+`git merge-base`, 2026-11-19). None of their commits appear in [R] as current tips — the
+register's `pending:feat/draft-vocab-head-buckets` set is stale (10 registered shas, zero
+overlap with the current 23-commit tip — finding F2). Branch evidence therefore = git itself
+(diffstat, test files) + [HB] pipeline runs 02–04; runtime effect is **unverified** unless
+[HB] names a measurement path.
 
 ### 4.1 `feat/qsa-nvfp4-fp8-gather` (7 commits, `6bdcfa37ab`, run 02)
 
@@ -298,10 +310,15 @@ Run after every landing on `rc/*` and before every release step of §7:
 
 ```bash
 cd /srv/community-repos/sglang-wt-rc2
-git log --format=%h --abbrev=10 25c1c439..rc/qwen38-rc2 | sort > /tmp/range.txt
-grep -E '^\| \*\*G' docs/PATCH-LEDGER.md | grep -oE '`[0-9a-f]{10}`' | tr -d '`' | sort > /tmp/doc.txt
-comm -23 /tmp/range.txt /tmp/doc.txt | wc -l   # must be 0 — every range commit listed
+PIN=1ad48f14e1                     # stack tip at ledger delivery; docs commits after the pin live in the DOK row
+git log --format=%h --abbrev=10 25c1c439..$PIN | sort > /tmp/range.txt
+grep -E '^\| \*\*[GD]' docs/PATCH-LEDGER.md | grep -oE '`[0-9a-f]{10}`' | tr -d '`' | sort > /tmp/doc.txt
+comm -23 /tmp/range.txt /tmp/doc.txt | wc -l   # must be 0 — every stack commit listed
 uniq -d /tmp/doc.txt                            # must be empty — each listed exactly once
+# informational: any NEW non-docs commit on the branch beyond $PIN must become a G row:
+git log --format='%h %s' --abbrev=10 $PIN..rc/qwen38-rc2
 ```
 
-Result at creation (2026-11-19 11:04 UTC): range=155, listed=155, missing=0, duplicated=0.
+Result at creation (2026-11-19 11:04 UTC, re-checked after the §4 header fix): pinned
+range=155, listed=155 in G rows (+1 DOK row), missing=0, duplicated=0; only docs commits
+(`091eaa3a04` and its follow-ups) sit beyond the pin.
