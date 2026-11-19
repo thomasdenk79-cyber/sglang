@@ -1,3 +1,4 @@
+import os
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -53,6 +54,51 @@ def test_fused_shared_columns_and_out_of_range_ids_are_never_pruned():
         ids, w, 17, _cfg(tau=0.5, min_rows=1), num_shared_cols=1
     )
     assert ids.tolist() == [[1, -1, 16], [3, 99, 16]]
+
+
+# A fused shared column (last) carrying the LARGEST weight of the row, with all
+# three routed routes singleton and below tau. If the shared column competed for
+# the row's rank it would hold rank 0 and every routed route would be prunable.
+_SHARED_TOP_IDS = [[10, 11, 12, 20], [13, 14, 15, 20]]
+_SHARED_TOP_W = [[0.02, 0.02, 0.02, 0.94], [0.03, 0.03, 0.03, 0.91]]
+
+
+def test_top_weighted_shared_column_leaves_the_routed_top_route():
+    ids = torch.tensor(_SHARED_TOP_IDS, dtype=torch.int32)
+    w = torch.tensor(_SHARED_TOP_W)
+    mask = ps.prune_singleton_mask_reference(
+        ids, w, tau=0.08, min_rows=2, num_expert_slots=21, num_shared_cols=1
+    )
+    # Two of the three routed routes go, never all three.
+    assert mask[:, :3].sum(dim=1).tolist() == [2, 2]
+    ps.maybe_prune_singleton_routes_(ids, w, 21, _cfg(tau=0.08), num_shared_cols=1)
+    assert (ids != -1)[:, :3].sum(dim=1).tolist() == [1, 1]
+    assert ids[:, 3].tolist() == [20, 20]
+    assert w[:, 3].tolist() == pytest.approx([0.94, 0.91])
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
+)
+def test_kernel_leaves_the_routed_top_route_with_a_top_weighted_shared_column():
+    # The reference above is not enough: the kernel computes rank independently,
+    # and it is the kernel that ships.
+    ids = torch.tensor(_SHARED_TOP_IDS, dtype=torch.int32)
+    w = torch.tensor(_SHARED_TOP_W)
+    ps._launch_prune_kernel_(
+        topk_ids=ids,
+        topk_weights=w,
+        cnt=None,
+        m=2,
+        k=4,
+        num_expert_slots=21,
+        num_shared_cols=1,
+        cfg=_cfg(tau=0.08),
+    )
+    assert (ids != -1)[:, :3].sum(dim=1).tolist() == [1, 1]
+    assert ids[:, 3].tolist() == [20, 20]
+    assert w[:, 3].tolist() == pytest.approx([0.94, 0.91])
 
 
 def test_padded_rows_are_ignored_and_not_counted():

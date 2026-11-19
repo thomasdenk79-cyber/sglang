@@ -33,6 +33,16 @@ scratch exists. ``RENORM`` additionally allocates the pre-prune row sum and
 launches the rescale kernels on top of that; it is off by default, like every
 other knob here. The feature changes the model output (lossy).
 
+Cost of the pre-step, and the follow-up. This is HyperBurst's *p1* shape: the
+selection is one extra Triton launch ahead of the MoE call rather than folded
+into FlashInfer's routing prologue (their *p2* variant edits the prologue in
+``csrc`` and needs a FlashInfer rebuild, so it is the follow-up, not this
+port). The extra launch is what p1 pays for that independence: HB measured the
+routing prologue grow 256.5 -> 484.2 us/step for p1 (hyperburst
+``docs/lab-notes/P2_LOG.md:242``) while the csrc p2 variant saved 836 us/step
+at W4, so p1 keeps only part of the prize and the launch is the reason. Judge
+any measured gain here against the p1 numbers, not the p2 envelope.
+
 The launch honours ``SGLANG_TRITON_PDL`` (see ``sglang.kernels.triton_pdl``);
 with the flag off the PTX and the launch config are identical to the
 un-instrumented kernel.
@@ -91,14 +101,27 @@ def get_prune_config() -> PruneConfig:
     return cfg
 
 
-def _within_row_rank(topk_weights: torch.Tensor) -> torch.Tensor:
-    """0-based rank by weight, larger first; the column index breaks ties."""
+def _within_row_rank(
+    topk_weights: torch.Tensor, routed: Optional[int] = None
+) -> torch.Tensor:
+    """0-based rank by weight, larger first; the column index breaks ties.
+
+    Only the first ``routed`` columns compete, which is what makes the top-route
+    protection actually protect: a fused shared-expert column carries a fixed
+    weight (``moe_fused_gate`` writes 1.0), so counting it would hand it rank 0
+    and push every routed route of the row to rank >= 1, where a light row loses
+    its entire routed contribution -- the opposite of the "every row keeps its
+    top route" invariant above.
+    """
     w = topk_weights.float()
     k = w.shape[1]
+    competing = k if routed is None else routed
     col = torch.arange(k, device=w.device)
     gt = (w[:, None, :] > w[:, :, None]) | (
         (w[:, None, :] == w[:, :, None]) & (col[None, None, :] < col[None, :, None])
     )
+    if competing < k:
+        gt[:, :, competing:] = False
     return gt.sum(dim=2)
 
 
@@ -133,7 +156,7 @@ def prune_singleton_mask_reference(
         valid
         & (cnt == 1)
         & (topk_weights.float() < tau)
-        & (_within_row_rank(topk_weights) >= min_rank)
+        & (_within_row_rank(topk_weights, k - num_shared_cols) >= min_rank)
         & (torch.arange(k, device=ids.device) < k - num_shared_cols)[None, :]
     )
 
@@ -207,10 +230,15 @@ def _kernel():
         w = tl.load(w_ptr + off, mask=m, other=0.0).to(tl.float32)
         valid = m & (ids >= 0) & (ids < NUM_SLOTS)
 
+        # Rank competes over the routed columns only: a fused shared column at
+        # rank 0 would make every routed route of the row rank >= 1 and so
+        # prunable, dropping the row's whole routed contribution.
         gt = (w[:, None, :] > w[:, :, None]) | (
             (w[:, None, :] == w[:, :, None]) & (c[None, None, :] < c[None, :, None])
         )
-        rank = tl.sum((gt & m[:, None, :]).to(tl.int32), axis=2)
+        rank = tl.sum(
+            (gt & m[:, None, :] & (c[None, None, :] < K_ROUTED)).to(tl.int32), axis=2
+        )
 
         if PAIRWISE:
             cnt = tl.zeros([MP, KP], tl.int32)
