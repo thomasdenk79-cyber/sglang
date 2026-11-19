@@ -1023,6 +1023,8 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # One log line per admitted request: prompt tokens from device, SSD or recompute.
+    SGLANG_HICACHE_ADMISSION_LOG = EnvBool(False)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)

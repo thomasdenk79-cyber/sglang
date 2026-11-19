@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ import torch
 
 from sglang.srt.beam_search.batch_tail import beam_decode_budget
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers.admission_log import admission_fields, format_admission
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -1494,6 +1496,7 @@ class PrefillAdder:
             )
             return
 
+        device_hit = host_hit = storage_hit = 0
         if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
@@ -1520,6 +1523,25 @@ class PrefillAdder:
             fulfilled_tokens=fulfilled_storage_hit,
             reason=reason,
         )
+
+        if envs.SGLANG_HICACHE_ADMISSION_LOG.get():
+            # Queue wait on the same perf_counter() clock that stamped the entry.
+            t = req.time_stats.wait_queue_entry_time
+            wait_ms = int((time.perf_counter() - t) * 1000) if t > 0 else -1
+            logger.info(
+                format_admission(
+                    req.rid,
+                    admission_fields(
+                        prompt_len=len(req.full_untruncated_fill_ids),
+                        prefix_len=prefix_len,
+                        device_hit=device_hit,
+                        host_hit=host_hit,
+                        storage_hit=storage_hit,
+                        attempts=req.storage_prefetch_retry_attempts,
+                        wait_ms=wait_ms,
+                    ),
+                )
+            )
 
     def _get_dllm_remain_tokens(
         self, req: Optional[Req] = None, *, reuses_kv: bool = False
