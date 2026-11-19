@@ -101,6 +101,92 @@ def test_kernel_leaves_the_routed_top_route_with_a_top_weighted_shared_column():
     assert w[:, 3].tolist() == pytest.approx([0.94, 0.91])
 
 
+# The row's top weight sits on an id that is not an expert at all: stale
+# metadata a padded buffer left behind. Such a column must not compete for the
+# row's rank, or a live route loses its top-``MIN_RANK`` seat to a value that no
+# GEMM will ever read.
+_DEAD_TOP_IDS = [[-1, 5], [7, 9]]
+_DEAD_TOP_W = [[0.90, 0.02], [0.90, 0.03]]
+
+
+def test_weight_on_an_invalid_id_does_not_outrank_the_only_live_route():
+    ids = torch.tensor(_DEAD_TOP_IDS, dtype=torch.int32)
+    w = torch.tensor(_DEAD_TOP_W)
+    mask = ps.prune_singleton_mask_reference(
+        ids, w, tau=0.08, min_rows=2, num_expert_slots=16
+    )
+    # Row 0 keeps its only live route (expert 5): nothing that outranks it is a
+    # live routed expert. Row 1 has two live ids, so the light singleton below
+    # tau still goes and the top route stays -- the pre-existing behaviour.
+    assert mask.tolist() == [[False, False], [False, True]]
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
+)
+@pytest.mark.parametrize("pairwise", [False, True])
+def test_kernel_ignores_dead_ids_when_ranking(pairwise):
+    # Same rule on the path that ships, histogram and pairwise alike.
+    ids = torch.tensor(_DEAD_TOP_IDS, dtype=torch.int32)
+    w = torch.tensor(_DEAD_TOP_W)
+    ps._launch_prune_kernel_(
+        topk_ids=ids,
+        topk_weights=w,
+        cnt=None if pairwise else torch.zeros(16, dtype=torch.int32),
+        m=2,
+        k=2,
+        num_expert_slots=16,
+        num_shared_cols=0,
+        cfg=_cfg(tau=0.08),
+    )
+    assert ids.tolist() == [[-1, 5], [7, -1]]
+    assert w[0].tolist() == pytest.approx([0.90, 0.02])
+    assert w[1].tolist() == pytest.approx([0.90, 0.0])
+
+
+# Col 0 is dead metadata at 0.95, cols 1-5 are live routed experts, cols 6-7
+# are fused shared. Excluding dead ids must not exclude live ones: the first
+# 0.40 route keeps rank 0, the three equal-weight routes behind it are still
+# outranked, and so is the 0.02 route behind all four of them.
+_LIVE_RANK_IDS = [[-1, 5, 6, 7, 8, 9, 2, 3], [-1, -1, -1, -1, -1, -1, -1, -1]]
+_LIVE_RANK_W = [[0.95, 0.02, 0.40, 0.40, 0.40, 0.40, 1.00, 1.00], [0.0] * 8]
+
+
+def test_live_ids_still_compete_once_dead_ones_are_excluded():
+    ids = torch.tensor(_LIVE_RANK_IDS, dtype=torch.int32)
+    w = torch.tensor(_LIVE_RANK_W)
+    mask = ps.prune_singleton_mask_reference(
+        ids, w, tau=0.5, min_rows=2, num_expert_slots=16, num_shared_cols=2
+    )
+    assert mask.tolist() == [
+        [False, True, False, True, True, True, False, False],
+        [False] * 8,
+    ]
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
+)
+@pytest.mark.parametrize("pairwise", [False, True])
+def test_kernel_still_ranks_live_ids(pairwise):
+    ids = torch.tensor(_LIVE_RANK_IDS, dtype=torch.int32)
+    w = torch.tensor(_LIVE_RANK_W)
+    ps._launch_prune_kernel_(
+        topk_ids=ids,
+        topk_weights=w,
+        cnt=None if pairwise else torch.zeros(16, dtype=torch.int32),
+        m=2,
+        k=8,
+        num_expert_slots=16,
+        num_shared_cols=2,
+        cfg=_cfg(tau=0.5),
+    )
+    assert ids.tolist() == [[-1, -1, 6, -1, -1, -1, 2, 3], [-1] * 8]
+    assert w[0, :6].tolist() == pytest.approx([0.95, 0.0, 0.40, 0.0, 0.0, 0.0])
+
+
 @pytest.mark.skipif(
     os.environ.get("TRITON_INTERPRET") != "1",
     reason="direct CPU kernel launch needs TRITON_INTERPRET=1",
@@ -181,6 +267,56 @@ def test_histogram_scratch_is_left_zeroed_after_launch():
         results.append((ids.tolist(), w.tolist()))
     assert results[0][0] == [[7, 3, -1], [7, 5, 9]]
     assert results[0] == results[1], "a reused scratch changed the prune decision"
+
+
+def test_every_live_row_keeps_its_best_live_route():
+    """The top-route protection is an invariant, not one lucky case.
+
+    The maximal live routed column of a row has rank 0 among live routed
+    competitors, so no ``min_rank`` >= 1 can prune it. Every invalid routed
+    column carries a weight above tau on purpose: under the old ranking such a
+    column took the rank slot and cost the row's best real route its seat, which
+    is what turns this sweep red. Ids are drawn from a slot space far larger
+    than the batch so ``cnt == 1`` stays true, the other precondition a prune
+    needs; without that the bug could hide behind a duplicated expert id.
+    """
+    torch.manual_seed(20261119)
+    k, routed, slots, tau = 8, 6, 2048, 0.5
+    for _ in range(50):
+        ids = torch.randint(0, slots, (16, k), dtype=torch.int32)
+        w = torch.rand(16, k, dtype=torch.float32) * tau
+        dead = torch.rand(16, routed) < 0.4
+        ids[:, :routed] = torch.where(
+            dead,
+            torch.randint(-4, -1, (16, routed), dtype=torch.int32),
+            ids[:, :routed],
+        )
+        w[:, :routed] = torch.where(
+            dead, tau + torch.rand(16, routed) * tau, w[:, :routed]
+        )
+        mask = ps.prune_singleton_mask_reference(
+            ids,
+            w,
+            tau=tau,
+            min_rank=1,
+            min_rows=1,
+            max_rows=64,
+            num_expert_slots=slots,
+            num_shared_cols=k - routed,
+        )
+        live = (ids >= 0) & (ids < slots)
+        live[:, routed:] = False
+        for row in range(ids.shape[0]):
+            cols = live[row].nonzero(as_tuple=True)[0]
+            if cols.numel() == 0:
+                continue
+            best = int(cols[torch.argmax(w[row, cols])].item())
+            assert not bool(mask[row, best]), (
+                f"row {row} lost its best live route {best}: "
+                f"ids={ids[row].tolist()} "
+                f"weights={[round(float(x), 3) for x in w[row]]} "
+                f"mask={mask[row].tolist()}"
+            )
 
 
 def test_padded_rows_are_ignored_and_not_counted():

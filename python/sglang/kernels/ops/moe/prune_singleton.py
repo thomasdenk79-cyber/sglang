@@ -17,8 +17,10 @@ for batches of ``[MIN_ROWS, MAX_ROWS]`` rows. A masked route gets expert id
 ``-1`` (unless ``KEEP_IDS``) and weight 0. FlashInfer's CUTLASS MoE and the
 SM120 SwiGLU kernels skip expert ids outside ``[0, num_experts)``, so nothing
 downstream changes; ``-1`` also cannot collide with a fused shared-expert slot.
-Every row keeps its top route, so no live row loses all of its experts. Ids
-outside ``[0, num_expert_slots)`` are neither counted nor pruned. Rows that
+Every live row keeps its highest-weight live route, so no live row loses all of
+its experts: an id outside ``[0, num_expert_slots)`` is neither counted, pruned
+nor ranked, so a stale weight parked on a dead id cannot cost a real route its
+top-``MIN_RANK`` seat. Rows that
 upstream masked as padding (all ids ``-1``) are ignored; unmasked stale rows of
 a padded graph bucket still count. ``RENORM`` rescales the surviving routed
 weights of a pruned row back to that row's routed weight sum before pruning;
@@ -102,7 +104,9 @@ def get_prune_config() -> PruneConfig:
 
 
 def _within_row_rank(
-    topk_weights: torch.Tensor, routed: Optional[int] = None
+    topk_weights: torch.Tensor,
+    routed: Optional[int] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """0-based rank by weight, larger first; the column index breaks ties.
 
@@ -112,6 +116,10 @@ def _within_row_rank(
     and push every routed route of the row to rank >= 1, where a light row loses
     its entire routed contribution -- the opposite of the "every row keeps its
     top route" invariant above.
+
+    With ``valid`` given, only live routed experts compete as well. An id
+    outside ``[0, num_expert_slots)`` has no weight in the MoE, so letting one
+    compete would let a stale value rank above the row's only real route.
     """
     w = topk_weights.float()
     k = w.shape[1]
@@ -120,6 +128,8 @@ def _within_row_rank(
     gt = (w[:, None, :] > w[:, :, None]) | (
         (w[:, None, :] == w[:, :, None]) & (col[None, None, :] < col[None, :, None])
     )
+    if valid is not None:
+        gt = gt & valid[:, None, :]
     if competing < k:
         gt[:, :, competing:] = False
     return gt.sum(dim=2)
@@ -156,7 +166,7 @@ def prune_singleton_mask_reference(
         valid
         & (cnt == 1)
         & (topk_weights.float() < tau)
-        & (_within_row_rank(topk_weights, k - num_shared_cols) >= min_rank)
+        & (_within_row_rank(topk_weights, k - num_shared_cols, valid) >= min_rank)
         & (torch.arange(k, device=ids.device) < k - num_shared_cols)[None, :]
     )
 
@@ -232,12 +242,16 @@ def _kernel():
 
         # Rank competes over the routed columns only: a fused shared column at
         # rank 0 would make every routed route of the row rank >= 1 and so
-        # prunable, dropping the row's whole routed contribution.
+        # prunable, dropping the row's whole routed contribution. It competes
+        # over *live* columns only for the same reason -- ``valid`` already
+        # implies the row is in range, so it replaces the plain row mask, and a
+        # stale weight on an invalid id can no longer outrank a real route.
         gt = (w[:, None, :] > w[:, :, None]) | (
             (w[:, None, :] == w[:, :, None]) & (c[None, None, :] < c[None, :, None])
         )
         rank = tl.sum(
-            (gt & m[:, None, :] & (c[None, None, :] < K_ROUTED)).to(tl.int32), axis=2
+            (gt & valid[:, None, :] & (c[None, None, :] < K_ROUTED)).to(tl.int32),
+            axis=2,
         )
 
         if PAIRWISE:
