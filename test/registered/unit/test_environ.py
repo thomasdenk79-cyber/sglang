@@ -247,5 +247,31 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                     self.assertIs(field.get(), expected)
 
 
+class TestLossyAndExperimentalKnobsAreStrict(unittest.TestCase):
+    """The MoE prune tau and the Triton PDL flag must be registered strict.
+
+    Both default to off, so a relaxed field would turn an unparsable value into
+    "the arm silently ran as the baseline" instead of an error -- exactly the
+    drift the gpuq needle attribution is built to catch. Parsing behaviour is
+    covered in ``kernels/test_triton_pdl.py``; this pins the registration.
+    """
+
+    KNOBS = {
+        "SGLANG_MOE_SINGLETON_PRUNE_TAU": 0.0,
+        "SGLANG_TRITON_PDL": False,
+    }
+
+    def test_registered_default_off_and_strict(self):
+        for name, default in self.KNOBS.items():
+            with self.subTest(name=name):
+                field = vars(type(envs)).get(name)
+                self.assertIsNotNone(field, f"{name} is not registered on envs")
+                self.assertIs(field.strict, True)
+                with patch.dict(os.environ):
+                    os.environ.pop(name, None)
+                    os.environ.pop("SGLANG_MOE_PRUNE_SINGLETON_TAU", None)
+                    self.assertEqual(field.get(), default)
+
+
 if __name__ == "__main__":
     unittest.main()
