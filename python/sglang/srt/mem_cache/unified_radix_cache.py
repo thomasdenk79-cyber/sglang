@@ -89,7 +89,12 @@ from sglang.srt.mem_cache.kv.plan import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.storage_prefetch import (
+    RestorePromise,
+    RestoreState,
+    StoragePrefetchRetries,
+    restore_wait_s,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -230,6 +235,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # SGLANG_HICACHE_RESTORE_REQUIRED; init_hicache reads it.
+    restore_required: bool = False
+    restore_min_wait_s: float = 120.0
 
     def __init__(
         self,
@@ -675,6 +683,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self.restore_required = envs.SGLANG_HICACHE_RESTORE_REQUIRED.get()
+        self.restore_min_wait_s = envs.SGLANG_HICACHE_RESTORE_MIN_WAIT_S.get()
         self._residency = CacheResidency(
             tree_core=self.tree_core, is_write_back=self.is_write_back
         )
@@ -2973,21 +2983,51 @@ class UnifiedRadixCache(BasePrefixCache):
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
+    def _short_prefetch_timeout(self) -> bool:
+        """The stock `timeout` policy: a per-operation budget sized by pages."""
+        return self.prefetch_stop_policy == "timeout"
+
+    def _prefetch_deadline_active(self) -> bool:
+        """Whether live prefetches are cut by the rank-agreed tick vote."""
+        return self._short_prefetch_timeout() or (
+            self.restore_required and self.prefetch_stop_policy == "wait_complete"
+        )
+
+    def pending_restore_promise(self, rid: str) -> Optional[RestorePromise]:
+        if not self.restore_required:
+            return None
+        return self.storage_prefetch_retries.promises.pending(rid)
+
+    def storage_io_open(self, rid: str) -> bool:
+        """A lookup or fetch of `rid` is live or queued for re-issue."""
+        return self.storage_prefetch_retries.is_pending(rid) or any(
+            request.rid == rid for request in self.ongoing_prefetch
+        )
+
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
-            self.prefetch_stop_policy == "timeout"
+            self._prefetch_deadline_active()
             and operation.handle not in self._storage_prefetch_wait
         ):
             # Start at the first blocked admission poll; refetches keep this budget.
-            pages = operation.stats_requested_tokens // self.page_size
-            wait = _StoragePrefetchWait(
-                timeout_s=self.prefetch_timeout_base
-                + pages * self.prefetch_timeout_per_page,
-            )
+            if self._short_prefetch_timeout():
+                pages = operation.stats_requested_tokens // self.page_size
+                timeout_s = (
+                    self.prefetch_timeout_base + pages * self.prefetch_timeout_per_page
+                )
+            else:
+                # An unconfirmed lookup under wait_complete: hang protection only.
+                timeout_s = restore_wait_s(
+                    operation.stats_requested_tokens, self.restore_min_wait_s
+                )
+            wait = _StoragePrefetchWait(timeout_s=timeout_s)
             wait.timer.observe(ready=False)
             self._storage_prefetch_wait[operation.handle] = wait
 
     def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
+        if self.pending_restore_promise(operation.handle.rid) is not None:
+            # A confirmed hit is cut only by its promise deadline.
+            return False
         if operation.host_indices is not None and (
             operation.completed_tokens >= len(operation.hash_value) * self.page_size
         ):
@@ -3012,11 +3052,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
-        if self.prefetch_stop_policy == "wait_complete":
+        if self.prefetch_stop_policy == "wait_complete" and not self.restore_required:
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
-        if self.prefetch_stop_policy == "timeout":
+        if self._prefetch_deadline_active():
             # The verdict is agreed once per tick by _vote_prefetch_deadlines,
             # which also terminates the operation (the poll then takes the
             # is_terminated path); a poll only reads it, so ranks may poll
@@ -3040,21 +3080,47 @@ class UnifiedRadixCache(BasePrefixCache):
         here so the transfer worker and the hit drain stop spending on it;
         its retirement stays with the admission poll or the drain.
         """
-        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+        operations = (
+            [info.operation for info in self.ongoing_prefetch.values()]
+            if self._prefetch_deadline_active()
+            else []
+        )
+        promises = (
+            self.storage_prefetch_retries.promises if self.restore_required else ()
+        )
+        num_promises = len(promises)
+        if not operations and not num_promises:
             return
-        operations = [info.operation for info in self.ongoing_prefetch.values()]
-        expired = [0] * len(operations)
+        expired = [0] * (len(operations) + num_promises)
         if self.pp_rank == 0:
             expired = [
                 int(self._prefetch_deadline_expired(operation))
                 for operation in operations
             ]
+            if num_promises:
+                expired += promises.expiry_votes(time.perf_counter())
+        # Restore promises share the one MAX vote, after the live prefetches.
         verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
         self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
-        for operation, verdict in zip(operations, verdicts.tolist()):
+        verdicts = verdicts.tolist()
+        for operation, verdict in zip(operations, verdicts):
             if verdict:
                 self._mark_prefetch_deadline_expired(operation)
                 self.cache_controller.terminate_prefetch(operation)
+        if num_promises:
+            for promise in promises.apply_verdicts(
+                verdicts[len(operations) :], time.perf_counter()
+            ):
+                self._expire_restore_promise(promise)
+
+    def _expire_restore_promise(self, promise: RestorePromise) -> None:
+        """Stop the restore work of a timed-out promise; the scheduler aborts
+        the request (typed restore_timeout), whose release frees the rest."""
+        self.storage_prefetch_retries.cancel(promise.rid)
+        for request, info in list(self.ongoing_prefetch.items()):
+            if request.rid == promise.rid:
+                self._mark_prefetch_deadline_expired(info.operation)
+                self.cache_controller.terminate_prefetch(info.operation)
 
     def _hicache_sync_digest(self) -> int:
         """Value piggybacked on the ready-count MIN sync: equal on every rank
@@ -3065,15 +3131,19 @@ class UnifiedRadixCache(BasePrefixCache):
         the same tick on every rank, instead of hanging in a vote of a
         different length. Fits int64: 42-bit digest * 1000003 + crc32."""
         digest = self.tree_core.write_back_duplicate_reclaim_digest
+        live = []
         if (
             self.enable_storage
-            and self.prefetch_stop_policy == "timeout"
+            and self._prefetch_deadline_active()
             and self.ongoing_prefetch
         ):
-            live = "\0".join(
+            live.extend(
                 f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
             )
-            digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
+        if self.restore_required:
+            live.extend(self.storage_prefetch_retries.promises.digest_keys())
+        if live:
+            digest = digest * 1000003 + zlib.crc32("\0".join(live).encode()) + 1
         return digest
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -3193,6 +3263,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if self._is_pp_ticketed(request):
             return self._check_pp_prefetch_progress(request)
 
+        if self.restore_required:
+            promise = self.storage_prefetch_retries.promises.get(request.rid)
+            if promise is not None and promise.expired is True:
+                # Ends as restore_timeout; never admitted on a partial prefix.
+                return False
+
         if request not in self.ongoing_prefetch:
             return True
 
@@ -3202,7 +3278,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            if self._prefetch_deadline_active():
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
@@ -3260,6 +3336,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
 
         if self.buffer_pipeline is not None:
+            if self.restore_required:
+                self.storage_prefetch_retries.promises.advance(
+                    operation_id=operation.id, state=RestoreState.STAGED
+                )
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
             return self.buffer_pipeline.stage_completed_prefetch(
@@ -3444,6 +3524,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return True
 
+    def _confirm_restore_promise(self, operation: PrefetchOperation) -> None:
+        """Pin the restore promise at the first rank-agreed positive hit; a
+        re-read of the same generation keeps its span and deadline."""
+        self.storage_prefetch_retries.promises.confirm(
+            rid=operation.handle.rid,
+            operation_id=operation.id,
+            promised_end=operation.storage_start + operation.storage_hit_count,
+            missing_tokens=operation.storage_hit_count,
+            now=time.perf_counter(),
+            min_wait_s=self.restore_min_wait_s,
+        )
+
     def _record_storage_prefetch_hit(
         self, request: CacheRequestHandle, num_tokens: int
     ) -> None:
@@ -3579,6 +3671,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
+        if self.restore_required:
+            self.storage_prefetch_retries.promises.drop(rid)
         if self.linker is not None:
             self.linker.release_request(request)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
@@ -3929,9 +4023,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 info, hit_tokens, aux_hit_tokens = self._trim_buffer_prefetch_full_head(
                     request, info, operation, full_match_len, hit_tokens
                 )
-                return self.buffer_pipeline.allocate_and_queue_prefetch(
+                queued = self.buffer_pipeline.allocate_and_queue_prefetch(
                     operation, info, hit_tokens, aux_hit_tokens
                 )
+                if queued and self.restore_required:
+                    self.storage_prefetch_retries.promises.advance(
+                        operation_id=operation.id, state=RestoreState.STAGING
+                    )
+                return queued
             aux_hit_tokens = hit_tokens
 
             # Hybrid pools (SWA / Mamba) are trailing-window aligned, so a
@@ -4072,6 +4171,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(request)
                     continue
                 self._account_prefetch_outcome(operation, revoked=False)
+                if buffer_mode and self.restore_required:
+                    self._confirm_restore_promise(operation)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
                 parked_ahead = buffer_mode and bool(

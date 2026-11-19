@@ -42,7 +42,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
-    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+    from sglang.srt.mem_cache.storage_prefetch import (
+        RestorePromise,
+        StoragePrefetchRetries,
+    )
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -527,6 +530,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
+
+    def pending_restore_promise(self, rid: str) -> Optional[RestorePromise]:
+        """SGLANG_HICACHE_RESTORE_REQUIRED promise owed to `rid`; only the
+        unified cache issues them."""
+        return None
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""

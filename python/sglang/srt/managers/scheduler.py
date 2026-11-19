@@ -353,6 +353,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.storage_prefetch import RESTORE_TIMEOUT_ERR_TYPE
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
@@ -3906,6 +3907,8 @@ class Scheduler(
             self.waiting_queue,
             memory.hicache_storage_prefetch_retry_poll_interval,
             memory.hicache_storage_prefetch_retry_max_attempts,
+            # A refetch of a confirmed span is bounded by its restore deadline.
+            uncapped_immediate=envs.SGLANG_HICACHE_RESTORE_REQUIRED.get(),
         ):
             self._retry_storage_prefetch(req, storage_hit_end)
 
@@ -3914,7 +3917,16 @@ class Scheduler(
     ) -> None:
         req.storage_prefetch_retry_attempts += 1
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
-        if req.storage_prefetch_retry_attempts >= max_attempts:
+        restore_promised = (
+            self.tree_cache.pending_restore_promise(req.rid) is not None
+        )
+        if req.storage_prefetch_retry_attempts >= max_attempts and restore_promised:
+            logger.debug(
+                "HiCache restore re-read req=%s attempt=%d (deadline-bounded)",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+        elif req.storage_prefetch_retry_attempts >= max_attempts:
             logger.warning(
                 "HiCache storage prefetch reissue cap reached req=%s attempts=%d; "
                 "the request is admitted without further L3 lookups",
@@ -3941,6 +3953,20 @@ class Scheduler(
         current_match_len = req.prefix_len + req.host_hit_length
         if current_match_len >= previous_match_len:
             return False
+        promise = self.tree_cache.pending_restore_promise(req.rid)
+        if promise is not None:
+            # A confirmed span is re-read until its deadline, never recomputed.
+            logger.warning(
+                "HiCache device prefix shrank before admission req=%s "
+                "lookup_match=%d current_match=%d; re-reading promised span",
+                req.rid,
+                previous_match_len,
+                current_match_len,
+            )
+            self._retry_storage_prefetch(req, promise.promised_end)
+            # Defer only on open I/O; otherwise the staged-admission gate
+            # re-arms the read and still refuses a partial prefix.
+            return self.tree_cache.storage_io_open(req.rid)
         if (
             req.storage_prefetch_retry_attempts
             >= get_memory().hicache_storage_prefetch_retry_max_attempts
@@ -4029,6 +4055,32 @@ class Scheduler(
             )
             return False
         return True
+
+    def _abort_restore_timeouts(self) -> None:
+        """Abort waiting requests whose restore promise expired (rank-agreed
+        by the tick vote) with the typed, retryable restore_timeout error."""
+        retries = self.tree_cache.storage_prefetch_retries
+        if retries is None:
+            return
+        timeouts = {promise.rid for promise in retries.promises.take_timeouts()}
+        if not timeouts:
+            return
+        for req in [r for r in self.waiting_queue if r.rid in timeouts]:
+            timeouts.discard(req.rid)
+            message = (
+                "HiCache restore of the confirmed cached prefix missed its "
+                "deadline; retry the request"
+            )
+            reason = FINISH_ABORT(
+                message, HTTPStatus.SERVICE_UNAVAILABLE, RESTORE_TIMEOUT_ERR_TYPE
+            )
+            self.request_retirer.abort(
+                req, reason=reason, finished_reason=reason.to_json()
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        for rid in timeouts:
+            # Not queued any more (ended elsewhere): retire the generation.
+            retries.promises.drop(rid)
 
     def _abort_unavailable(self, req: Req, *, message: str) -> None:
         self.request_retirer.abort(
@@ -4380,6 +4432,11 @@ class Scheduler(
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
+            if (
+                self.enable_hicache_storage
+                and envs.SGLANG_HICACHE_RESTORE_REQUIRED.get()
+            ):
+                self._abort_restore_timeouts()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
@@ -4992,8 +5049,16 @@ class Scheduler(
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
         if self.enable_hicache_storage and retries is not None:
+            now = time.perf_counter()
+            restore_required = envs.SGLANG_HICACHE_RESTORE_REQUIRED.get()
             for req in can_run_list:
                 retries.cancel(req.rid)
+                if restore_required:
+                    retries.promises.admit(
+                        req.rid,
+                        covered_end=req.prefix_len + req.host_hit_length,
+                        now=now,
+                    )
         # Every other request of the batch comes from the waiting queue.
         admitted = [req for req in can_run_list if req is not resumed_req]
         self.invariant_checker.check_admitted(admitted)

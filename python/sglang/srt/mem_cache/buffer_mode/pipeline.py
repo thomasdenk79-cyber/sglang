@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
+    RestoreState,
     StagedPrefetchPlan,
     WindowLoadBackPlan,
 )
@@ -1889,6 +1890,8 @@ class BufferModePipeline:
         """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None
         f = self.staged_prefetches.get(req.cache_request_handle)
+        if not self._restore_promise_ready(req, f):
+            return False
         if f is None:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
                 self._clear_storage_hit(req)
@@ -2068,6 +2071,45 @@ class BufferModePipeline:
         req.storage_hit_start = None
         req.host_hit_is_storage = False
 
+    def _restore_required(self) -> bool:
+        # Strict identity: only a real cache flag enables the promise paths.
+        return getattr(self._cache, "restore_required", False) is True
+
+    def _restore_promise_ready(
+        self, req: Req, f: Optional[_StagedPrefetch]
+    ) -> bool:
+        """SGLANG_HICACHE_RESTORE_REQUIRED: a confirmed storage hit admits only
+        once its whole promised span is staged or device-resident; anything
+        less re-reads the span instead of recomputing it."""
+        cache = self._cache
+        if not self._restore_required():
+            return True
+        promises = cache.storage_prefetch_retries.promises
+        promise = promises.get(req.rid)
+        if promise is None:
+            return True
+        if promise.expired:
+            return False
+        if req.prefix_len >= promise.promised_end:
+            # The device match alone covers the span.
+            return True
+        if f is not None:
+            if f.matched_len + f.num_tokens >= promise.promised_end:
+                return True
+            logger.warning(
+                "HiCache restore partial req=%s staged_end=%d promised_end=%d",
+                req.rid,
+                f.matched_len + f.num_tokens,
+                promise.promised_end,
+            )
+            self.release_staged_hold(f.request, reason="shrunk")
+        if not cache.storage_io_open(req.rid):
+            # The span was lost with no I/O open: re-read it, never recompute.
+            promises.reset_to_promised(req.rid)
+            promise.rearms += 1
+            cache.storage_prefetch_retries.refetch(req.rid, promise.promised_end)
+        return False
+
     def _refetch_staged(self, f: _StagedPrefetch) -> None:
         self.release_staged_hold(f.request, reason="shrunk")
         self._cache.storage_prefetch_retries.refetch(
@@ -2202,6 +2244,24 @@ class BufferModePipeline:
                 defers,
             )
             return
+        if (
+            self._restore_required()
+            and cache.pending_restore_promise(req.rid) is not None
+        ):
+            # Free the host bounce so younger requests backfill; the promise
+            # keeps span and deadline and its gate re-reads (no recompute).
+            logger.warning(
+                "HiCache staged prefetch released after %d device_capacity "
+                "deferrals req=%s pool=%s tokens=%d (restore promised)",
+                defers,
+                req.rid,
+                pool,
+                f.num_tokens,
+            )
+            self.release_staged_hold(request, reason="device_capacity")
+            cache.storage_prefetch_retries.promises.reset_to_promised(req.rid)
+            req.staged_prefetch_plan = None
+            return
         # Still unmaterializable: drop the hold so the admission loop stops
         # breaking on this request, which recomputes on its next pass.
         logger.warning(
@@ -2297,6 +2357,10 @@ class BufferModePipeline:
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
+        if self._restore_required():
+            cache.storage_prefetch_retries.promises.advance(
+                operation_id=f.operation_id, state=RestoreState.LOADING
+            )
         cache._settle_storage_prefetch_hit(
             request, credited_tokens=req.storage_hit_length
         )

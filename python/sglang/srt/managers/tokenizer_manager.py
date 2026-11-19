@@ -148,6 +148,7 @@ from sglang.srt.managers.utils import (
     truncate_input_ids,
 )
 from sglang.srt.mem_cache.events import attach_mm_routing_labels
+from sglang.srt.mem_cache.storage_prefetch import RESTORE_TIMEOUT_ERR_TYPE
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
@@ -242,6 +243,15 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+class TypedAbortError(fastapi.HTTPException):
+    """A non-stream abort whose OpenAI `error.type` is set by the scheduler
+    (`FINISH_ABORT.err_type`), not derived from its status code."""
+
+    def __init__(self, status_code: int, detail: str, err_type: str):
+        super().__init__(status_code=status_code, detail=detail)
+        self.err_type = err_type
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -2310,6 +2320,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not is_stream:
             if status_code == HTTPStatus.BAD_REQUEST:
                 raise ValueError(finish_reason["message"])
+            if finish_reason.get("err_type") == RESTORE_TIMEOUT_ERR_TYPE:
+                raise TypedAbortError(
+                    status_code=status_code,
+                    detail=finish_reason["message"],
+                    err_type=RESTORE_TIMEOUT_ERR_TYPE,
+                )
             raise fastapi.HTTPException(
                 status_code=status_code, detail=finish_reason["message"]
             )

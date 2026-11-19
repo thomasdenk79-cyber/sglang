@@ -112,6 +112,8 @@ from sglang.srt.function_call.utils import (
     without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TypedAbortError
+from sglang.srt.mem_cache.storage_prefetch import RESTORE_TIMEOUT_ERR_TYPE
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
@@ -2581,9 +2583,16 @@ class OpenAIServingChat(OpenAIServingBase):
                             interrupted = True
                             break
                         code = finish_reason["status_code"]
+                        # restore_timeout is typed by the scheduler; every
+                        # other abort keeps its status-derived type.
+                        err_type = (
+                            RESTORE_TIMEOUT_ERR_TYPE
+                            if finish_reason.get("err_type") == RESTORE_TIMEOUT_ERR_TYPE
+                            else code.name
+                        )
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
-                            code.name,
+                            err_type,
                             code.value,
                         )
                         yield f"data: {error}\n\n"
@@ -2858,6 +2867,10 @@ class OpenAIServingChat(OpenAIServingBase):
             ).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except TypedAbortError as e:
+            return self.create_error_response(
+                e.detail, err_type=e.err_type, status_code=e.status_code
+            )
 
         if not isinstance(ret, list):
             ret = [ret]

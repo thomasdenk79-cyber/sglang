@@ -1025,6 +1025,12 @@ class Envs:
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
     # One log line per admitted request: prompt tokens from device, SSD or recompute.
     SGLANG_HICACHE_ADMISSION_LOG = EnvBool(False)
+    # A confirmed storage hit is loaded in full before admission or the request
+    # ends with a typed restore_timeout; it is never admitted on a partial prefix.
+    SGLANG_HICACHE_RESTORE_REQUIRED = EnvBool(False)
+    # Restore deadline floor; the effective deadline is
+    # max(this, 1 + 0.25 * ceil(missing_tokens / 1000)) seconds from the first hit.
+    SGLANG_HICACHE_RESTORE_MIN_WAIT_S = EnvFloat(120.0)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
