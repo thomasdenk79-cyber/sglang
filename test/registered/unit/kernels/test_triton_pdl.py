@@ -444,7 +444,7 @@ def test_hip_backend_rejects_the_launch_pdl_kwarg():
     """
     import types
 
-    from triton.backends.amd.compiler import HIPOptions, HIPBackend
+    from triton.backends.amd.compiler import HIPBackend, HIPOptions
     from triton.backends.nvidia.compiler import CUDAOptions
     from triton.runtime.jit import JITFunction
 
@@ -569,6 +569,29 @@ def test_undecided_gate_warns_once_then_lights_up(monkeypatch, caplog):
         assert len(warns) == 1
         state["ok"] = True
         assert triton_pdl.triton_pdl_enabled() is True
+    finally:
+        triton_pdl._reset_pdl_device_gate()
+
+
+def test_platform_probe_leaves_the_shared_platform_cache_untouched(monkeypatch):
+    """A pre-device PDL probe must not publish into the process-wide cache.
+
+    ``detect(use_cache=False)`` re-probes *and* writes ``spec._DETECTED_PLATFORM``,
+    which the rest of the kernels package reads back with ``use_cache=True``; a
+    probe here would republish another component's cached platform as whatever
+    this process happens to see right now.
+    """
+    from sglang.kernels import spec as kernel_spec
+
+    sentinel = kernel_spec.PlatformInfo(
+        device_type="cuda", cuda_arch_major=99, cuda_arch_minor=9
+    )
+    monkeypatch.setenv("SGLANG_TRITON_PDL", "1")
+    monkeypatch.setattr(kernel_spec, "_DETECTED_PLATFORM", sentinel)
+    triton_pdl._reset_pdl_device_gate()
+    try:
+        triton_pdl.triton_pdl_enabled()
+        assert kernel_spec._DETECTED_PLATFORM is sentinel
     finally:
         triton_pdl._reset_pdl_device_gate()
 
