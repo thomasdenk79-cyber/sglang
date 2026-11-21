@@ -439,5 +439,72 @@ class TestOrphanTmpGc(_StoreCase):
         kv.free(idx)
 
 
+class TestClearSuffixScope(_StoreCase):
+    """R10: clear() may only remove this deployment's own files."""
+
+    def _own_file(self, storage, key, pool_name=PoolName.KV):
+        stem = storage._get_component_key(key, str(pool_name))
+        path = self.dir / f"{stem}.bin"
+        path.write_bytes(b"y" * 64)
+        return path
+
+    def test_clear_keeps_foreign_names_and_reports_them(self):
+        pools = self._pools()
+        storage = self._storage(pools)
+        own_bin = self._own_file(storage, "page-own")
+        own_sidecar = self._own_file(storage, "page-side", SIDECAR_NAMES[0])
+        # Same .bin shape, another deployment's suffix (shared file_path).
+        foreign_bin = self.dir / f"page-foreign{storage.config_suffix}-other.bin"
+        foreign_bin.write_bytes(b"n" * 64)
+        own_tmp = self.dir / ".abcdef0123456789abcdef0123456789.tmp"
+        own_tmp.write_bytes(b"t" * 64)
+        foreign_tmp = self.dir / "abcdef0123456789abcdef0123456789.tmp"
+        foreign_tmp.write_bytes(b"f" * 64)
+        foreign = self.dir / "fremd.dat"
+        foreign.write_bytes(b"x" * 64)
+        # Same name shape, another deployment's key: our writer-side suffix
+        # ends in the tail component _0_1, so only the page counter tells the
+        # owners apart (_0_1 vs _1_1).
+        foreign_keyed = self.dir / f"page-other{storage.tp_config_suffix[:-3]}_1_1.bin"
+        foreign_keyed.write_bytes(b"o" * 64)
+        # Directories are never file-deletion targets.
+        subdir = self.dir / "subdir"
+        subdir.mkdir()
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+        ) as logs:
+            self.assertTrue(storage.clear())
+
+        self.assertFalse(own_bin.exists(), "own .bin must be removed")
+        self.assertFalse(own_sidecar.exists(), "own sidecar .bin must be removed")
+        self.assertFalse(own_tmp.exists(), "own .tmp must be removed")
+        for kept in (foreign, foreign_keyed, foreign_bin, foreign_tmp):
+            self.assertTrue(kept.exists(), f"foreign file {kept.name} was deleted")
+        self.assertTrue(subdir.exists(), "directories are not clear() targets")
+        listing = "\n".join(logs.output)
+        for kept in (foreign, foreign_keyed, foreign_bin, foreign_tmp):
+            self.assertIn(kept.name, listing, "skipped files must be reported")
+        self.assertEqual(
+            sorted(p.name for p in self.dir.iterdir() if p.is_file()),
+            sorted(p.name for p in (foreign, foreign_keyed, foreign_bin, foreign_tmp)),
+        )
+
+    def test_clear_removes_pages_written_through_backend(self):
+        # Files created by the real write path must still be removed.
+        pools = self._pools()
+        storage = self._storage(pools, extra={"max_size": "1G"})
+        idx, _ = self._write(pools, storage, seed=29)
+        written = sorted(p.name for p in self.dir.iterdir() if p.is_file())
+        self.assertTrue(written)
+        self.assertTrue(storage.clear())
+        self.assertEqual(
+            [p.name for p in self.dir.iterdir() if p.is_file()],
+            [],
+            f"backend-written files survived clear(): {written}",
+        )
+        self.assertEqual(storage._evictor._total_bytes, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
