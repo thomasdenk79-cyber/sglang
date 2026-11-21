@@ -5,6 +5,7 @@ import errno
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 # O_DIRECT needs the buffer address, length and file offset on this alignment.
 _DIRECT_IO_ALIGN = 4096
+# Interrupted HiCacheFile writes leave ``.{uuid4-hex}.tmp`` behind (see
+# HiCacheFile._set_file). Anchored match keeps unrelated names safe: only our
+# own dot-prefixed hex temps count, never a plain ``<hex>.tmp`` of a co-tenant.
+_TMP_FILE_RE = re.compile(r"^\.[0-9a-fA-F]{32}\.tmp$")
 
 
 def _address_buffer(address: int, num_bytes: int) -> memoryview:
@@ -1022,18 +1027,18 @@ class HiCacheFile(HiCacheStorage):
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
         if storage_config.unified_suffixes is not None:
-            owned_suffixes = (
+            self._owned_suffixes = (
                 self._unified_suffixes if storage_config.is_storage_writer else ()
             )
         else:
             # Each rank owns its TP-sharded state; selected DCP writers
             # also own their shared MLA shard files.
-            owned_suffixes = (self.tp_config_suffix,)
+            self._owned_suffixes = (self.tp_config_suffix,)
             if storage_config.is_rank_replicated and storage_config.is_storage_writer:
-                owned_suffixes += (self.config_suffix,)
+                self._owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
-            owned_suffixes=owned_suffixes,
+            owned_suffixes=self._owned_suffixes,
             tp_rank=tp_rank,
             extra_config=storage_config.extra_config,
             on_evict=(
@@ -1678,12 +1683,46 @@ class HiCacheFile(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._write_page)
 
+    def _owns_filename(self, filename: str) -> bool:
+        """Whether ``clear()`` may remove ``filename`` from a shared store.
+
+        Ownership rule (hicache spec, deletion rule R10): a file belongs to
+        this deployment when its name is one of our ``.bin`` data pages, i.e.
+        ``<key><suffix>.bin`` with ``<suffix>`` in the owned key-suffix set, or
+        one of our own ``.{uuid-hex}.tmp`` write temps. The suffix set matches
+        the ``owned_suffixes`` handed to the LRU evictor: the TP shard suffix
+        plus, for replicated models, the shared MLA suffix; a unified
+        non-writer rank owns no ``.bin`` pages at all. Write temps are not
+        key-derived, so every rank still reaps its own orphans. Foreign names
+        in a shared ``file_path`` (another model's or rank's pages) stay on
+        disk and are reported as a finding instead of being deleted.
+        """
+        if filename.endswith(".bin"):
+            stem = filename[: -len(".bin")]
+            return any(stem.endswith(suffix) for suffix in self._owned_suffixes)
+        return _TMP_FILE_RE.match(filename) is not None
+
     def clear(self) -> bool:
         try:
+            skipped = []
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
+                if not os.path.isfile(file_path):
+                    continue
+                if self._owns_filename(filename):
                     os.remove(file_path)
+                else:
+                    skipped.append(filename)
+            if skipped:
+                # R10: never delete another deployment's pages; surface them.
+                logger.warning(
+                    "HiCacheFile.clear() left %d foreign file(s) untouched in "
+                    "%s (deletion rule R10): %s%s",
+                    len(skipped),
+                    self.file_path,
+                    ", ".join(sorted(skipped[:20])),
+                    ", ..." if len(skipped) > 20 else "",
+                )
             self._evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()
