@@ -575,6 +575,7 @@ def bf16_skinny_gemv_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.is_cuda
+        and weight.device == x.device
         and x.is_contiguous()
         and weight.stride(1) == 1
         # Not differentiable; nn.Linear weights keep requires_grad under no_grad.
