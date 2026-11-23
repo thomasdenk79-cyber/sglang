@@ -671,7 +671,9 @@ class StaticKVStorage:
         request (its replay ring's unflushed depth, 0 without one); the lag
         restarts at zero."""
         write_pos = self._allocator.state.pool.replayssm_write_pos
-        if write_pos is None:
+        # A request that never got a state slot (lazy allocation) has no lag;
+        # indexing with None would read the whole ring instead of one slot.
+        if write_pos is None or slot is None:
             return 0
         slot = self._allocator.state_ids(sub_pool).ids(slot)
         lag = int(write_pos[slot].item())
