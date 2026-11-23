@@ -496,7 +496,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             server_args.tp_size != 1
             or server_args.pp_size != 1
             or server_args.dp_size != 1
-            or server_args.enable_dp_attention
+            or get_parallel().attn_dp_enabled
         ):
             # Each rank would grow its own ring and draft different tokens.
             raise ValueError(
