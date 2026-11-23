@@ -107,6 +107,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1137,7 +1138,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = self.head_v_dim
         tokens, heads, head_dim = z_shape_og
         if (
-            self.out_proj.tp_size != 1
+            get_group_rank_size(self.out_proj.tp_group)[1] != 1
             or getattr(self.out_proj, "use_decode_attn_tp", False)
             or self.out_proj.bias is not None
             or self.norm.group_size is not None
