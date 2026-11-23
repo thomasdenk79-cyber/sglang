@@ -455,7 +455,11 @@ def _gdn_stub(tokens=4, head_v_dim=G, heads=48, tp_size=1, **norm_over):
         return torch.full((x.shape[0], 7), 3.0, dtype=torch.bfloat16)
 
     out_proj = SimpleNamespace(
-        tp_size=tp_size,
+        tp_group=(
+            None
+            if tp_size == 1
+            else SimpleNamespace(rank_in_group=0, world_size=tp_size)
+        ),
         use_decode_attn_tp=False,
         bias=None,
         quant_method=SimpleNamespace(apply_norm_gated=apply_norm),
@@ -501,7 +505,11 @@ def test_hook_routes_the_measured_call(_flag_on):
 @pytest.mark.parametrize(
     "field,value,why",
     [
-        ("tp_size", 2, "tensor-parallel out_proj"),
+        (
+            "tp_group",
+            SimpleNamespace(rank_in_group=0, world_size=2),
+            "tensor-parallel out_proj",
+        ),
         ("use_decode_attn_tp", True, "decode attn-tp"),
         ("bias", torch.zeros(2560), "biased out_proj"),
     ],

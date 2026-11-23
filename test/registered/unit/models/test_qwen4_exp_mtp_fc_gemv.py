@@ -153,7 +153,7 @@ def test_kernel_and_torch_agree_on_the_real_fc_shape(m):
     )
 
     torch.manual_seed(0)
-    lin = _linear()
+    lin = _linear().to("cuda")
     x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
     assert bf16_skinny_gemv_applies(x, lin.weight)
     y = bf16_skinny_linear(x, lin.weight)
