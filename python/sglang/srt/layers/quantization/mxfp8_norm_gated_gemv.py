@@ -76,6 +76,8 @@ logger = logging.getLogger(__name__)
 
 #: One UE8M0 scale byte covers this many contiguous K elements (MXFP8 group).
 GROUP_K = 32
+# Triton kernels may only read constexpr globals.
+_GROUP_K_C = tl.constexpr(GROUP_K)
 
 #: Widest decode batch the hook serves; wider calls keep the unfused path.
 MAX_M = 16
@@ -108,7 +110,7 @@ def _mxfp8_norm_gated_gemv_kernel(
     z_ptr,
     nw_ptr,  # norm weight, [G]
     w_ptr,  # e4m3 [N, K], row-major
-    s_ptr,  # UE8M0 bytes [N, K // GROUP_K], row-major
+    s_ptr,  # UE8M0 bytes [N, K // _GROUP_K_C], row-major
     y_ptr,
     ws_ptr,
     cnt_ptr,
@@ -133,7 +135,7 @@ def _mxfp8_norm_gated_gemv_kernel(
     offs_g = tl.arange(0, G)
     n_mask = offs_n < N
     w_base = w_ptr + offs_n[:, None] * K
-    sf_k = K // GROUP_K
+    sf_k = K // _GROUP_K_C
     if NORM_FUSED:
         norm_w = tl.load(nw_ptr + offs_g).to(tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -184,15 +186,15 @@ def _mxfp8_norm_gated_gemv_kernel(
         sb = tl.load(
             s_ptr
             + offs_n[:, None] * sf_k
-            + (k0 // GROUP_K)
-            + tl.arange(0, G // GROUP_K)[None, :],
+            + (k0 // _GROUP_K_C)
+            + tl.arange(0, G // _GROUP_K_C)[None, :],
             mask=n_mask[:, None],
             other=0,
         )
         # UE8M0 -> fp32: exponent bits only, so a zero byte is a zero scale.
         sg = (sb.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         wf = tl.reshape(
-            tl.reshape(w.to(tl.float32), (BLOCK_N, G // GROUP_K, GROUP_K))
+            tl.reshape(w.to(tl.float32), (BLOCK_N, G // _GROUP_K_C, _GROUP_K_C))
             * sg[:, :, None],
             (BLOCK_N, G),
         )
