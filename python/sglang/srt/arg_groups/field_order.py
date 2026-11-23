@@ -362,7 +362,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_backend_extra_config",
     "hicache_storage_prefetch_retry_poll_interval",
     "hicache_storage_prefetch_retry_max_attempts",
-    "hicache_storage_prefetch_host_capacity_wait_ms",
     "enable_unified_cache_external_linker",
     "unified_cache_external_linker_backend",
     "enable_hisparse",
@@ -589,5 +588,7 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    # Fork-only fields go last so upstream positional slots stay stable.
+    "hicache_storage_prefetch_host_capacity_wait_ms",
 )
 # fmt: on

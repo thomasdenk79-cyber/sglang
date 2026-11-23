@@ -1774,7 +1774,13 @@ def test_qsa_graph_metadata_replays_reuse_one_variant(monkeypatch):
     for kernel in kernels:
         monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
     pages, ratio = 32, 4
-    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    from sglang.srt.mem_cache.qsa_kv_pool import qsa_pending_ring_size
+
+    pool = SimpleNamespace(
+        qsa_compress_ratio=ratio,
+        qsa_compressed_page_size=16,
+        qsa_ring_size=qsa_pending_ring_size(ratio, 16),
+    )
     table = torch.arange(34 * pages * 64, dtype=torch.int32, device="cuda")
     table = table.reshape(34, -1)
 
