@@ -412,10 +412,15 @@ class NVFP4DenseLinearMethod:
             # silently takes the original BF16 path instead.
             if gemm is not None and (r1 - r0) % 16 == 0 and w32.shape[1] % 16 == 0:
                 w_fp8, w_scale = _quantize_fp8_per_tensor(w32)
+                # sgl_kernel's CUTLASS dispatch requires per-column scales_b
+                # (`numel == N`); a [1] scalar raises "size of scales_b is not
+                # matched". native_scalar_a_scale on SM120 keeps scales_a [1],
+                # so expand only w_scale without a host sync.
+                w_scale_col = w_scale.expand(r1 - r0).contiguous()
                 # `.t()` matches `apply_fp8_linear`: that callsite also passes a
                 # transposed, K-major [K, N] fp8 weight to `fp8_scaled_mm`.
                 y[:, r0:r1] = gemm(
-                    x_fp8, w_fp8.t(), x_scale, w_scale, out_dtype=torch.bfloat16
+                    x_fp8, w_fp8.t(), x_scale, w_scale_col, out_dtype=torch.bfloat16
                 )
             else:
                 w = w32.to(torch.bfloat16)
