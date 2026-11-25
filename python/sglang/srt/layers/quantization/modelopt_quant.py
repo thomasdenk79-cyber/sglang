@@ -2602,6 +2602,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _trtllm_hidden_alignment(self, layer: torch.nn.Module) -> int:
+        """Port of upstream 0f1509829b, switch-gated off by default.
+
+        Set SGLANG_P16_NVFP4_TRTPAD_HIDDEN=1 to pad TRT-LLM NVFP4 MoE hidden
+        dims to 256/512. Switches off => alignment 1 => donor behaviour.
+        """
+        if os.getenv("SGLANG_P16_NVFP4_TRTPAD_HIDDEN", "0") != "1":
+            return 1
+        if getattr(layer, "hidden_size", None) is None:
+            raise ValueError("NVFP4 hidden padding requires layer.hidden_size")
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        return trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2749,9 +2768,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
+        # TRT-LLM pads a misaligned hidden dim and therefore needs BF16
+        # activations; FP4 dispatch would quantize them at the unpadded size.
+        trtllm_pads_hidden = (
+            self.enable_flashinfer_trtllm_moe
+            and layer.hidden_size % self._trtllm_hidden_alignment(layer) != 0
+        )
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
-            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_dispatch_fp4 = (
+            not self.quant_config.use_per_token_activation
+            and not trtllm_pads_hidden
+            and (
+                MOE_NVFP4_DISPATCH
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            )
         )
 
         layer.dispatcher.set_quant_config(
@@ -2800,7 +2830,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            align_fp4_moe_weights_for_flashinfer_trtllm(
+                layer, hidden_alignment=self._trtllm_hidden_alignment(layer)
+            )
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -3057,6 +3089,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
+                padded_hidden_size=getattr(layer, "trtllm_padded_hidden_size", None),
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,

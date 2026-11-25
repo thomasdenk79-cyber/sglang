@@ -385,8 +385,10 @@ def fused_qkv_split_gdn_prefill_kernel(
     HEAD_V: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
+    # Port of upstream 304a6016b3: keep QKV-split offsets in int64 so a
+    # strided/large-column pool cannot wrap signed int32.
+    i_t = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
     k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K

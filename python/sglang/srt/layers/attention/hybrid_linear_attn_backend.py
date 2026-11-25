@@ -121,9 +121,11 @@ class MambaAttnBackendBase(AttentionBackend):
         # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
+            # Port of upstream ff68baae6d: keep translated track indices
+            # int64 so every layer's pool write avoids an implicit cast.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
-            )
+            ).to(torch.int64)
         # Resolve the tracked-row selection once per forward
         has_mamba_track_mask = bool(
             forward_batch.mamba_track_mask is not None
@@ -334,7 +336,9 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        # Port of upstream 03d4f49f22: a 0-dim CUDA tensor bound as a clamp
+        # max synchronises the host. Keep the bound a tensor.
+        return torch.minimum(indices.clamp(min=0), query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch

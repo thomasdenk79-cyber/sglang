@@ -64,7 +64,7 @@ def _chain_block_t(seqlen: int, width: int) -> int:
     return triton.next_power_of_2(bt)
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -78,7 +78,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    # Port of upstream ff68baae6d: runtime arg + do_not_specialize avoids a
+    # recompile for every staged-pool batch size.
+    num_cache_lines,
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,

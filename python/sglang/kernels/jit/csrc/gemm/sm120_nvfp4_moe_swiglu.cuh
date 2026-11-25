@@ -25,20 +25,49 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// ---------------------------------------------------------------------------
+// P0.3 tuning knobs. Both default to the baseline values; the Python launcher
+// passes the same-named env vars as -D flags in extra_cuda_cflags, so each
+// variant gets its own JIT cache entry (cflags are in the BuildSpec/cache key).
+//   SGLANG_SM120_KUNIT = 32 tokens per MMA unit (allowed: 8, 16, 32)
+//   SGLANG_SM120_NSTG2 = 4 GEMM2 pipeline stages (allowed: 2..8)
+//
+// VALIDATION REQUIRED BEFORE ANY GPU RUN of a non-default variant:
+//   * bitwise equality vs cutlass_fused_moe(use_fused_finalize=False), gold test
+//     test/registered/kernels/ops/gemm/test_sm120_nvfp4_moe_swiglu.py;
+//   * skipped experts (ids < 0 or >= E) and all-skipped tokens (zero output);
+//   * CUDA-graph capture + replay with the variant's workspace sizes;
+//   * one process restart per variant (the JIT module is @cache_once), on a
+//     separate port -- never the live 8001 benchmark;
+//   * one measurement method for all variants (no warm-prefix/cold-prefill mix).
+// p16 has no nvcc/GPU: only CPU syntax checks run here; t15 does GPU validation.
+// ---------------------------------------------------------------------------
+#ifndef SGLANG_SM120_KUNIT
+#define SGLANG_SM120_KUNIT 32
+#endif
+#ifndef SGLANG_SM120_NSTG2
+#define SGLANG_SM120_NSTG2 4
+#endif
+
 namespace sglang {
 namespace nvfp4_swiglu_moe {
 
 constexpr int kRows = 128;            // weight rows per tile
 constexpr int kSeg = kRows / 2;       // GEMM1 tile = kSeg up rows + kSeg gate rows
 constexpr int kWarpRows = kRows / 4;  // weight rows per warp
-constexpr int kUnit = 32;             // tokens per unit
+constexpr int kUnit = SGLANG_SM120_KUNIT;       // tokens per unit (env SGLANG_SM120_KUNIT)
 constexpr int kThreads = 128;
-constexpr int kStages = 2;         // GEMM1 pipeline stages (GEMM2 uses twice as many half-size ones)
+constexpr int kStages = 2;                      // GEMM1 pipeline stages (128 B each)
+constexpr int kNStg2 = SGLANG_SM120_NSTG2;      // GEMM2 pipeline stages (64 B each, env SGLANG_SM120_NSTG2)
 constexpr int kStage1 = 128;       // bytes of every row per GEMM1 stage
 constexpr int kStage2 = 64;        // bytes of every row per GEMM2 stage
 constexpr int kOutLd = kRows + 8;  // bf16 elements per row of the epilogue tile
 constexpr int kPrologueThreads = 1024;
 constexpr int kStagedIds = 5120;  // routing ids staged in shared memory when T * TopK fits
+
+// kUnit is also the MMA B-tile depth (kUnit / 8) and the Python workspace stride.
+static_assert(kUnit == 8 || kUnit == 16 || kUnit == 32, "SGLANG_SM120_KUNIT must be 8, 16 or 32");
+static_assert(kNStg2 >= 2 && kNStg2 <= 8, "SGLANG_SM120_NSTG2 must be in [2, 8]");
 
 template <int KS>
 constexpr int stage_bytes() {
@@ -46,8 +75,10 @@ constexpr int stage_bytes() {
 }
 constexpr int kSlot = stage_bytes<kStage1>();
 static_assert(stage_bytes<kStage2>() <= kSlot / 2, "GEMM2 stage must fit half a GEMM1 stage");
-constexpr int kMainSmem = kStages * kSlot;
+// GEMM2 stages are half-size; >= 5 of them need more smem than two GEMM1 stages.
+constexpr int kMainSmem = (kStages * kSlot > kNStg2 * (kSlot / 2)) ? (kStages * kSlot) : (kNStg2 * (kSlot / 2));
 static_assert(kUnit * kOutLd * 2 <= kMainSmem, "epilogue tile must fit the stage buffers");
+static_assert(kNStg2 * (kSlot / 2) <= kMainSmem, "GEMM2 stage buffers exceed the shared-memory budget");
 
 template <int E, int TopK, int H, int I>
 struct Shape {
@@ -329,13 +360,17 @@ mainloop(float (&acc)[kWarpRows / 16][kUnit / 8][4], uint8_t* smem, const Params
       cp_async16(
           sw + r * KS + ((pc ^ swz<KS>(r)) * 16), tc.wbase + static_cast<size_t>(grow) * ROWB + s * KS + pc * 16);
     }
+    // Ceiling division: kUnit=8/16 gives fewer than kThreads A-pieces, so a
+    // floor-division trip count would silently skip all token-row loads.
 #pragma unroll
-    for (int i = 0; i < kUnit * PPR / kThreads; i++) {
+    for (int i = 0; i < (kUnit * PPR + kThreads - 1) / kThreads; i++) {
       const int idx = tid + i * kThreads;
-      const int r = idx / PPR, pc = idx % PPR;
-      const uint8_t* src = G1 ? p.xq + static_cast<size_t>(tc.s_tok[r]) * S::K1B + s * KS + pc * 16
-                              : p.aq + (static_cast<size_t>(tc.u) * kUnit + r) * S::K2B + s * KS + pc * 16;
-      cp_async16(sa + r * KS + ((pc ^ swz<KS>(r)) * 16), src);
+      if (idx < kUnit * PPR) {
+        const int r = idx / PPR, pc = idx % PPR;
+        const uint8_t* src = G1 ? p.xq + static_cast<size_t>(tc.s_tok[r]) * S::K1B + s * KS + pc * 16
+                                : p.aq + (static_cast<size_t>(tc.u) * kUnit + r) * S::K2B + s * KS + pc * 16;
+        cp_async16(sa + r * KS + ((pc ^ swz<KS>(r)) * 16), src);
+      }
     }
     // Weight SF: per (segment, i in 0..31, chunk c) 8 bytes = SF(row seg + i) and SF(row seg + 32 + i).
 #pragma unroll
@@ -415,26 +450,29 @@ swiglu_quant_epilogue(const Params& p, const __nv_bfloat16* sm_out, int u, int s
   using GE = cutlass::Array<__nv_bfloat16, 8>;
   constexpr int GQ = kSeg / 8;
   const int tid = threadIdx.x;
+  // Ceiling division keeps kUnit=8 (64 pieces < kThreads) functional.
 #pragma unroll
-  for (int it = 0; it < kUnit * GQ / kThreads; it++) {
+  for (int it = 0; it < (kUnit * GQ + kThreads - 1) / kThreads; it++) {
     const int item = it * kThreads + tid;
-    const int tok = item / GQ, q = item % GQ;
-    const GE up = *reinterpret_cast<const GE*>(sm_out + tok * kOutLd + 8 * q);
-    const GE gate = *reinterpret_cast<const GE*>(sm_out + tok * kOutLd + kSeg + 8 * q);
-    cutlass::epilogue::thread::SiLu<CE> silu{};
-    const CE act = silu(array_convert<CE>(gate)) * array_convert<CE>(up);
-    PackedVec pv;
+    if (item < kUnit * GQ) {
+      const int tok = item / GQ, q = item % GQ;
+      const GE up = *reinterpret_cast<const GE*>(sm_out + tok * kOutLd + 8 * q);
+      const GE gate = *reinterpret_cast<const GE*>(sm_out + tok * kOutLd + kSeg + 8 * q);
+      cutlass::epilogue::thread::SiLu<CE> silu{};
+      const CE act = silu(array_convert<CE>(gate)) * array_convert<CE>(up);
+      PackedVec pv;
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      pv.elts[i].x = static_cast<__nv_bfloat16>(act[i * 2 + 0]);
-      pv.elts[i].y = static_cast<__nv_bfloat16>(act[i * 2 + 1]);
+      for (int i = 0; i < 4; i++) {
+        pv.elts[i].x = static_cast<__nv_bfloat16>(act[i * 2 + 0]);
+        pv.elts[i].y = static_cast<__nv_bfloat16>(act[i * 2 + 1]);
+      }
+      const int ch = sub * kSeg + 8 * q;  // intermediate channel
+      const int blk = ch >> 4;            // SF block: stage blk / 8, byte blk % 8
+      uint8_t* sf_out =
+          (q & 1) ? nullptr : p.asf + ((static_cast<size_t>(u) * S::NS2 + (blk >> 3)) * kUnit + tok) * 8 + (blk & 7);
+      *reinterpret_cast<uint32_t*>(p.aq + (static_cast<size_t>(u) * kUnit + tok) * S::K2B + ch / 2) =
+          quantize_bf16x8(pv, gs, sf_out);
     }
-    const int ch = sub * kSeg + 8 * q;  // intermediate channel
-    const int blk = ch >> 4;            // SF block: stage blk / 8, byte blk % 8
-    uint8_t* sf_out =
-        (q & 1) ? nullptr : p.asf + ((static_cast<size_t>(u) * S::NS2 + (blk >> 3)) * kUnit + tok) * 8 + (blk & 7);
-    *reinterpret_cast<uint32_t*>(p.aq + (static_cast<size_t>(u) * kUnit + tok) * S::K2B + ch / 2) =
-        quantize_bf16x8(pv, gs, sf_out);
   }
 }
 
@@ -501,7 +539,7 @@ __global__ void __launch_bounds__(kThreads) persistent_main(Params p) {
       tc.seg0 = sub * kRows, tc.seg1 = sub * kRows + kSeg;
       tc.wbase = p.w2 + static_cast<size_t>(e) * H * S::K2B;
       tc.sfbase = p.w2_sf + static_cast<size_t>(e) * H * S::KP2;
-      mainloop<E, TopK, H, I, 2 * kStages, kStage2, kSlot / 2, false>(acc, smem, p, tc);
+      mainloop<E, TopK, H, I, kNStg2, kStage2, kSlot / 2, false>(acc, smem, p, tc);
     }
     __syncthreads();  // stage buffers are free: reuse them for the epilogue tile
 
@@ -629,6 +667,12 @@ struct Sm120Nvfp4MoeSwiglu {
 
     const DLDevice device = dev.unwrap();
     const auto main_kernel = k::persistent_main<E, TopK, H, I>;
+    // NSTG2=5 needs more than the default 48 KiB of dynamic shared memory; the
+    // opt-in is compiled out for the default 4-stage build.
+    if constexpr (k::kMainSmem > 48 * 1024) {
+      host::RuntimeDeviceCheck(::cudaFuncSetAttribute(
+          main_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(k::kMainSmem)));
+    }
     // Occupancy depends only on the kernel; the SM count is cached per device.
     static const uint32_t blocks_per_sm = runtime::get_blocks_per_sm(main_kernel, k::kThreads, k::kMainSmem);
     const uint32_t grid = runtime::get_sm_count(device.device_id) * blocks_per_sm;

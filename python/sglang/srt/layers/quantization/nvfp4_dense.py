@@ -45,6 +45,56 @@ CACHE_DIR = os.environ.get(
 )
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Parse a boolean switch the same way as the other fork-local flags."""
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+#: P0.2: large-M NVFP4 -> FP8 e4m3 prefill. Off by default: with every switch off
+#: the build must stay identical to the donor FP8 baseline.
+FP8_PREFILL_ENV = "SGLANG_NVFP4_DENSE_PREFILL_FP8"
+
+#: This fork targets CUDA sm_120, where `sglang` uses e4m3fn (finite max 448), not
+#: the ROCm e4m3fnuz (max 224). Keeping the dtype/max local (rather than importing
+#: `fp8_dtype` / `fp8_max`) makes the scale bookkeeping testable on CPU.
+_FP8_E4M3 = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+_FP8_SCALE_FLOOR = 1e-12
+
+
+def _quantize_fp8_per_tensor(x: torch.Tensor):
+    """Per-tensor e4m3 quantization: returns `(q, scale)` with `q.float() * scale ~= x`.
+
+    `q` has the same shape as `x` and dtype `float8_e4m3fn`; `scale` is a `[1]`
+    fp32 tensor. The scale is derived on-device (no `.item()` / host sync), so the
+    bookkeeping is capture-safe in principle -- although large-M prefill is not
+    captured today. Pure torch, hence CPU-testable.
+    """
+    xf = x.float()
+    amax = xf.abs().amax()
+    scale = (amax / _FP8_MAX).clamp(min=_FP8_SCALE_FLOOR).reshape(1)
+    q = (xf / scale).clamp(min=-_FP8_MAX, max=_FP8_MAX).to(_FP8_E4M3)
+    return q, scale
+
+
+def _fp8_gemm_helper():
+    """The fork's FP8 scaled GEMM (`fp8_utils.py:205`, used at `:1788-1963`), or None.
+
+    Imported lazily so a CPU-only process, a switches-off build, or a stack without
+    `sgl_kernel` keeps the BF16 fallback. Never let an optional import break serving.
+    """
+    try:
+        from sglang.srt.layers.quantization.fp8_utils import fp8_scaled_mm
+    except Exception as exc:  # optional backend / not a CUDA build
+        logger.debug("NVFP4 dense: FP8 GEMM helper unavailable: %s", exc)
+        try:
+            from sgl_kernel import fp8_scaled_mm
+        except Exception as exc2:
+            logger.debug("NVFP4 dense: sgl_kernel FP8 GEMM unavailable: %s", exc2)
+            return None
+    return fp8_scaled_mm
+
+
 def _index_path(model_dir: str) -> Optional[str]:
     for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         p = os.path.join(model_dir, name)
@@ -304,6 +354,8 @@ class NVFP4DenseLinearMethod:
           Looping the GEMV here would re-read the whole weight ~M/knob times; a GEMM
           amortises the weight read across all M rows instead. Chunking the dequant by
           output rows keeps the transient near 80 MB rather than the full BF16 weight.
+          With `SGLANG_NVFP4_DENSE_PREFILL_FP8=1` the dequant goes to FP8 e4m3 and the
+          GEMM is `sglang`'s own `fp8_scaled_mm`; otherwise it stays BF16 `torch.mm`.
         """
         from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import (
             _m_limit,
@@ -325,11 +377,51 @@ class NVFP4DenseLinearMethod:
                 m1 = min(M, m0 + chunk_m)
                 w4a16_nvfp4_gemv(x[m0:m1], wq, bs, gs, out=y[m0:m1])
             return y
+
+        # P0.2 -- large-M prefill. Off by default, so the switches-off build is
+        # unchanged. The FP8 branch reuses the existing GEMM helper; no new kernel.
+        #
+        # Scale convention: `bs` holds raw e4m3 bit patterns for 16-element blocks
+        # and `gs` is the global fp32 scale. `dequantize_nvfp4` already forms
+        # e2m1_code * e4m3_block_scale * gscale in fp32 -- we never touch `bs`/`gs`
+        # directly, so there is no second convention to drift from the GEMV path.
+        # `fp8_scaled_mm` computes (a @ b) * scales_a * scales_b, so expressing the
+        # weight as `w_fp8 * w_scale` and x as `x_fp8 * x_scale` yields the right
+        # product with two fp32 scalars and no host sync.
+        #
+        # Precision assumption: e2m1 (2 significand bits) times an e4m3 block scale
+        # (4 bits) needs 6 bits -- exact in BF16 (8 bits) but not in e4m3 (4 bits),
+        # so this branch loses ~2 weight mantissa bits, plus the usual bf16->e4m3
+        # loss on activations. That is why it is switch-gated and must pass the
+        # GSM8K/MMLU accuracy gate (<= 1% @ k=7) before it is shipped.
+        use_fp8 = (
+            _env_flag(FP8_PREFILL_ENV)
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.stride(1) == 1
+        )
+        gemm = _fp8_gemm_helper() if use_fp8 else None
+        x_fp8 = x_scale = None
+        if gemm is not None:
+            x_fp8, x_scale = _quantize_fp8_per_tensor(x)
+
         for r0 in range(0, N, _FALLBACK_ROW_CHUNK):
             r1 = min(N, r0 + _FALLBACK_ROW_CHUNK)
-            w = dequantize_nvfp4(wq[r0:r1], bs[r0:r1], gs).to(torch.bfloat16)
-            torch.mm(x.to(torch.bfloat16), w.t(), out=y[:, r0:r1])
-            del w
+            w32 = dequantize_nvfp4(wq[r0:r1], bs[r0:r1], gs)
+            # CUTLASS FP8 needs GEMM extents divisible by 16; a short tail chunk
+            # silently takes the original BF16 path instead.
+            if gemm is not None and (r1 - r0) % 16 == 0 and w32.shape[1] % 16 == 0:
+                w_fp8, w_scale = _quantize_fp8_per_tensor(w32)
+                # `.t()` matches `apply_fp8_linear`: that callsite also passes a
+                # transposed, K-major [K, N] fp8 weight to `fp8_scaled_mm`.
+                y[:, r0:r1] = gemm(
+                    x_fp8, w_fp8.t(), x_scale, w_scale, out_dtype=torch.bfloat16
+                )
+            else:
+                w = w32.to(torch.bfloat16)
+                torch.mm(x.to(torch.bfloat16), w.t(), out=y[:, r0:r1])
+                del w
+            del w32
         return y
 
 
@@ -349,13 +441,10 @@ class NVFP4DenseLinearMethod:
 #   CUDA-graph capture is settled.
 
 def _cat_flags():
-    def on(name):
-        return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
-
     cats = []
-    if on("SGLANG_LINEAR_ATTN_NVFP4"):
+    if _env_flag("SGLANG_LINEAR_ATTN_NVFP4"):
         cats.append("in_proj_qkvz")
-    if on("SGLANG_ATTN_NVFP4"):
+    if _env_flag("SGLANG_ATTN_NVFP4"):
         cats.append("qkv_proj")
     return tuple(cats)
 
