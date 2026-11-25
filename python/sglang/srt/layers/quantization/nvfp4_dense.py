@@ -54,6 +54,12 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #: the build must stay identical to the donor FP8 baseline.
 FP8_PREFILL_ENV = "SGLANG_NVFP4_DENSE_PREFILL_FP8"
 
+#: P0.2b: cache an e4m3 copy of the dense weight at pack time, so large-M
+#: prefill skips the per-call NVFP4 dequant entirely. Costs ~N*K bytes VRAM
+#: per dense layer (about 1 GB for the qkvz stack) and is therefore off by
+#: default; enable only after the KV-capacity trade-off is measured.
+FP8_CACHE_ENV = "SGLANG_NVFP4_DENSE_PREFILL_FP8_CACHE"
+
 #: This fork targets CUDA sm_120, where `sglang` uses e4m3fn (finite max 448), not
 #: the ROCm e4m3fnuz (max 224). Keeping the dtype/max local (rather than importing
 #: `fp8_dtype` / `fp8_max`) makes the scale bookkeeping testable on CPU.
@@ -399,17 +405,41 @@ class NVFP4DenseLinearMethod:
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and x.stride(1) == 1
+            # Defensive: large-M prefill is not captured today, but a future
+            # capture backend must silently keep the original BF16 path rather
+            # than introducing an unforged GEMM into a captured graph.
+            and not torch.cuda.is_current_stream_capturing()
         )
         gemm = _fp8_gemm_helper() if use_fp8 else None
         x_fp8 = x_scale = None
         if gemm is not None:
             x_fp8, x_scale = _quantize_fp8_per_tensor(x)
+        # P0.2b: a load-time FP8 copy removes the per-call dequant entirely.
+        # Absent unless both switches are on, so this is a no-op otherwise.
+        cached_w = getattr(layer, "nvfp4_fp8_w", None) if gemm is not None else None
+        cached_s = getattr(layer, "nvfp4_fp8_scale", None) if gemm is not None else None
 
         for r0 in range(0, N, _FALLBACK_ROW_CHUNK):
             r1 = min(N, r0 + _FALLBACK_ROW_CHUNK)
-            w32 = dequantize_nvfp4(wq[r0:r1], bs[r0:r1], gs)
             # CUTLASS FP8 needs GEMM extents divisible by 16; a short tail chunk
             # silently takes the original BF16 path instead.
+            if (
+                gemm is not None
+                and cached_w is not None
+                and (r1 - r0) % 16 == 0
+                and cached_w.shape[1] % 16 == 0
+            ):
+                # scales_b must have numel == N (fp8_gemm_kernel.cu:1168).
+                w_scale_col = cached_s.expand(r1 - r0).contiguous()
+                y[:, r0:r1] = gemm(
+                    x_fp8,
+                    cached_w[r0:r1].t(),
+                    x_scale,
+                    w_scale_col,
+                    out_dtype=torch.bfloat16,
+                )
+                continue
+            w32 = dequantize_nvfp4(wq[r0:r1], bs[r0:r1], gs)
             if gemm is not None and (r1 - r0) % 16 == 0 and w32.shape[1] % 16 == 0:
                 w_fp8, w_scale = _quantize_fp8_per_tensor(w32)
                 # sgl_kernel's CUTLASS dispatch requires per-column scales_b
@@ -488,6 +518,13 @@ def maybe_pack_dense_nvfp4(layer) -> bool:
     wq, bs, gscale = quantize_nvfp4(w.data)
     prealloc(wq.device)
     NVFP4DenseLinearMethod.attach(layer, wq, bs, gscale)
+    # P0.2b (off by default): keep an FP8 copy made directly from the still
+    # available BF16 weight. This avoids both the per-call NVFP4 dequant and
+    # one extra quantisation step, at the price of ~N*K VRAM per layer.
+    if _env_flag(FP8_PREFILL_ENV) and _env_flag(FP8_CACHE_ENV):
+        w_fp8, w_scale = _quantize_fp8_per_tensor(w.data)
+        layer.nvfp4_fp8_w = w_fp8.to(wq.device)
+        layer.nvfp4_fp8_scale = w_scale.to(wq.device)
     try:
         del layer.weight
     except AttributeError:
