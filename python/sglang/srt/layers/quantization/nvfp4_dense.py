@@ -21,6 +21,18 @@ deterministic, so it is written next to the token map under a key derived from t
 model shard's identity, the tensor name, and the exact row set. Any change to the model
 directory, the tensor, or the token map yields a different key, so a stale cache cannot
 be picked up silently.
+
+**Format strategy.** Format conversions are the expensive part, so each path fixes
+where a conversion happens rather than converting in the hot loop:
+
+* decode (default): BF16 activations x packed FP4 weight + row-major e4m3 block
+  scales -> custom FP4 GEMV. Weight stays FP4 in VRAM.
+* P0.2 / P0.2b: per-call NVFP4 -> FP8 dequant before a BF16/FP8 GEMM. Measured
+  slower than control, so both switches are off by default.
+* P0.2c: activations are quantized to FP4 per call (`fp4_quantize`); the weight
+  stays the *same* packed FP4 tensor, with one extra 128x4-swizzled copy of the
+  (small) block scales made at load time. `mm_fp4` then runs a native FP4 GEMM.
+  No dequant, no second weight, no host sync. Off by default.
 """
 
 import hashlib
@@ -59,6 +71,11 @@ FP8_PREFILL_ENV = "SGLANG_NVFP4_DENSE_PREFILL_FP8"
 #: per dense layer (about 1 GB for the qkvz stack) and is therefore off by
 #: default; enable only after the KV-capacity trade-off is measured.
 FP8_CACHE_ENV = "SGLANG_NVFP4_DENSE_PREFILL_FP8_CACHE"
+
+#: P0.2c: native NVFP4 GEMM for large-M prefill via FlashInfer `mm_fp4`.
+#: Keeps the weight in FP4 end-to-end (no dequant, no FP8 copy) and uses the
+#: same call pattern as `modelopt_quant.py:2147-2175`. Off by default.
+NATIVE_FP4_ENV = "SGLANG_NVFP4_DENSE_PREFILL_NATIVE_FP4"
 
 #: This fork targets CUDA sm_120, where `sglang` uses e4m3fn (finite max 448), not
 #: the ROCm e4m3fnuz (max 224). Keeping the dtype/max local (rather than importing
@@ -99,6 +116,24 @@ def _fp8_gemm_helper():
             logger.debug("NVFP4 dense: sgl_kernel FP8 GEMM unavailable: %s", exc2)
             return None
     return fp8_scaled_mm
+
+
+def _native_fp4_helpers():
+    """FlashInfer's native-NVFP4 primitives, or None. Lazy and fail-closed.
+
+    We deliberately call ``mm_fp4`` directly rather than sglang's ``fp4_gemm``
+    wrapper: the wrapper selects its backend via the global FP4 config, which
+    resolves to ``cute-dsl`` on a 12.x GPU (SM100-only kernel). ``mm_fp4``
+    ``backend="auto"`` instead picks ``b12x`` on SM120 / CUDA 13 and falls back
+    to CUTLASS for ragged K. Both consume the 128x4 swizzled scale layout that
+    ``fp4_quantize`` / ``block_scale_interleave`` produce.
+    """
+    try:
+        from flashinfer import block_scale_interleave, fp4_quantize, mm_fp4
+    except Exception as exc:
+        logger.debug("NVFP4 dense: native FP4 GEMM unavailable: %s", exc)
+        return None
+    return fp4_quantize, mm_fp4, block_scale_interleave
 
 
 def _index_path(model_dir: str) -> Optional[str]:
@@ -384,6 +419,41 @@ class NVFP4DenseLinearMethod:
                 w4a16_nvfp4_gemv(x[m0:m1], wq, bs, gs, out=y[m0:m1])
             return y
 
+        # P0.2c -- native NVFP4 GEMM for large-M prefill. Off by default.
+        #
+        # Format strategy: the weight stays packed FP4 end-to-end (the very same
+        # `wq` the decode GEMV reads) -- no dequant, no FP8 copy. Per call only
+        # the activations are quantized to FP4 with FlashInfer's `fp4_quantize`,
+        # and the load-time 128x4-swizzled block scales are reused. This is the
+        # same `fp4_quantize -> mm_fp4` flow as `modelopt_quant.py:2147-2175` and
+        # FlashInfer's own FP4 GEMM benchmark. `alpha` folds the activation and
+        # weight global scales into one fp32 product, computed on device so
+        # there is no host sync.
+        if (
+            _env_flag(NATIVE_FP4_ENV)
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.stride(1) == 1
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            helpers = _native_fp4_helpers()
+            sf = getattr(layer, "nvfp4_native_sf", None)
+            if helpers is not None and sf is not None:
+                fp4_quantize, mm_fp4, _ = helpers
+                x_inv = (448.0 * 6.0) / x.abs().amax().to(torch.float32).clamp_(
+                    min=1e-30
+                )
+                x_fp4, x_sf = fp4_quantize(x, x_inv)
+                return mm_fp4(
+                    x_fp4,
+                    wq.t(),
+                    x_sf.view(torch.float8_e4m3fn),
+                    sf.t(),
+                    (1.0 / x_inv) * gs,
+                    out_dtype=torch.bfloat16,
+                    backend="auto",
+                )
+
         # P0.2 -- large-M prefill. Off by default, so the switches-off build is
         # unchanged. The FP8 branch reuses the existing GEMM helper; no new kernel.
         #
@@ -521,7 +591,24 @@ def maybe_pack_dense_nvfp4(layer) -> bool:
     # P0.2b (off by default): keep an FP8 copy made directly from the still
     # available BF16 weight. This avoids both the per-call NVFP4 dequant and
     # one extra quantisation step, at the price of ~N*K VRAM per layer.
-    if _env_flag(FP8_PREFILL_ENV) and _env_flag(FP8_CACHE_ENV):
+    if _env_flag(NATIVE_FP4_ENV):
+        # P0.2c: the *same* packed FP4 weight (`wq`) serves the decode GEMV and
+        # the native GEMM. Only the block scales need a GEMM-layout copy:
+        # fp4_quantize/mm_fp4 consume a 128x4 swizzle, the GEMV row-major `bs`.
+        # `block_scale_interleave` is the op fp4_quantize applies internally,
+        # so this is bit-identical to quantizing the weight a second time --
+        # but costs only ~K/16 bytes per row instead of a second FP4 weight.
+        helpers = _native_fp4_helpers()
+        if helpers is None:
+            logger.warning("NVFP4 dense: native FP4 requested but unavailable; staying on BF16")
+        else:
+            _, _, block_scale_interleave = helpers
+            ks = wq.shape[1] * 2 // 16  # one e4m3 block scale per 16 K elements
+            sf = block_scale_interleave(bs)
+            layer.nvfp4_native_sf = sf.view(torch.float8_e4m3fn).reshape(
+                -1, (ks + 3) // 4 * 4
+            )
+    elif _env_flag(FP8_PREFILL_ENV) and _env_flag(FP8_CACHE_ENV):
         w_fp8, w_scale = _quantize_fp8_per_tensor(w.data)
         layer.nvfp4_fp8_w = w_fp8.to(wq.device)
         layer.nvfp4_fp8_scale = w_scale.to(wq.device)
