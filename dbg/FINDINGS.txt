@@ -1,0 +1,110 @@
+Adaptive speculative decoding on Qwen3.8-Flash-Next (NEXTN, topk=1) -- 2026-09-05
+================================================================================
+
+Two independent defects, both from the same root: for compressed-QSA draft
+models DraftBackendFactory.create_draft_extend_backend() (draft_utils.py:139)
+returns draft_model_runner.attn_backend instead of a fresh backend, so every
+adaptive runtime state's draft-extend runner shared ONE QwenSparseAttnBackend.
+
+(1) CRASH -- illegal memory access at the first decode after warmup.
+    eagle_draft_extend_cuda_graph_runner.py called
+    init_cuda_graph_state(max_bs, max_bs * num_draft_tokens) on that shared
+    backend, and QwenSparseAttnBackend.init_cuda_graph_state
+    (qwen_sparse_attn_backend.py:897-940) *reallocates* _graph_seq_lens /
+    _graph_compressed_page_table / _graph_fa2_* ... Building the steps=3 (8
+    rows) and steps=7 (16 rows) states freed the 32-row tensors the already
+    captured steps=15 draft-extend graphs had baked in.
+    Fix: init_cuda_graph_state_no_shrink() in adaptive_runtime_state.py.
+
+(2) SILENT ACCEPTANCE COLLAPSE -- the state-construction regression.
+    QwenSparseAttnBackend caches captured graph metadata as
+      self._cuda_graph_metadata[(forward_mode, bs)] = metadata
+    (qwen_sparse_attn_backend.py:1062), keyed by mode and batch size only --
+    NOT by the per-request token width. metadata_rows = bs * num_draft_tokens
+    for speculative-paged modes, so the steps=3 state's DRAFT_EXTEND_V2
+    capture REPLACED the launch state's entry with one sliced to 4 rows
+    instead of 16. The launch state then replayed its 16-wide draft-extend
+    graph after filling only 4 rows of QSA metadata: no crash (the stale rows
+    hold in-range indices), but the sparse selection seeding draft positions
+    past the short state's width is stale, so long chains stop being accepted.
+    Short chains are unaffected -- which is exactly the measured signature.
+    Fix: build a per-state draft-extend backend in
+    build_adaptive_runtime_state (eagle_worker_v2.py); costs ~0.14 GB/state.
+
+Bisection (pin15 = steps=3 state BUILT and never activated, 0 switches;
+fnbench greedy repeats=2; each block is one measurement window)
+
+  window 20:41-20:50            code-edit acc/tps   agent-loop acc/tps
+    plain W16, no adaptive        8.60 / 460          4.77 / 261
+    adaptive, nothing suppressed  5.66 / 311          4.39 / 242   <- regressed
+    no_draft (no draft backends
+      and no draft graphs)       11.62 / 604          4.94 / 268   <- recovered
+    no_target_graphs             6.13 / 334           3.91 / 215   <- regressed
+  => the loss is entirely on the draft side.
+
+  window 20:58-21:05
+    plain W16, no adaptive       10.77 / 564          4.72 / 240
+    no_draft_graphs (backends
+      built, capture skipped)     9.29 / 462          5.04 / 282   <- recovered
+    private_extend (own
+      draft-extend backend)      10.27 / 550          4.78 / 268   <- recovered
+  => the collision is created by the draft-extend graph CAPTURE writing into
+     the shared backend, and removing the aliasing removes it.
+
+Checked and cleared as causes: mamba/SSM slot accounting (same mamba usage and
+max_running_requests either way), the KV pool sizing, verify_mask (per backend,
+and unused by this backend), QwenSparseAttnBackend.__init__ (pure -- reads the
+runner, mutates nothing global), QSAMTPSharedSparseIndices (per state, and
+_override_worker_state reinstalls the launch state's object), the topk=1 chain
+buffers (rebuilt on restore; arange content is identical), and the FlashInfer
+autotune cache (would cost latency, not acceptance).
+
+Debug switches used, all default-off (never set in production; each leaves the
+extra state unusable): SGLANG_ADAPTIVE_SPLIT=no_draft | no_draft_graphs |
+no_target_graphs | no_gdn_recovery | shared_extend (restores the old aliasing
+for A/B). SGLANG_ADAPTIVE_DEBUG=1 logs what the controller's EMA actually saw
+per decision.
+
+After the fix -- final validation, one measurement window 21:31-21:40,
+fnbench greedy repeats=2, mem fraction 0.93, needle PASS on all three,
+shipped controller config (adaptive_w16_3_15.json):
+
+  workload     W4 acc/tps    W16 acc/tps    adaptive acc/tps   vs better fixed
+  code-edit    3.88 / 318    11.55 / 528     8.98 / 463         -12%
+  prose-en     2.57 / 220     3.10 / 156     2.54 / 229          +4%
+  prose-ja     2.29 / 208     3.31 / 170     2.25 / 205          -1%
+  agent-loop   3.19 / 282     4.87 / 235     4.05 / 306          +9%
+
+One server, no hand-picked profile, 10 switches over the whole benchmark.
+Against the profile a user would have had to pick wrongly: +46% over W4 on
+code-edit, +47% / +21% / +30% over W16 on prose-en / prose-ja / agent-loop.
+agent-loop beats BOTH fixed profiles -- the controller mixes them.
+
+Controller tuning history (all measured, not simulated):
+  v1 alpha .2 / interval 5 / reseed both ways   489 switches, code 5.46/316
+  v2 alpha .1 / interval 20 / reseed both ways  163 switches, code 5.17/300
+  v3 + grace 40, no reseed                       38 switches, code 5.29/303
+  (the draft-extend fix lands here)
+  v3 after the fix                               24 switches, code 9.57/504
+  v4 + down-only reseed, alpha .07, thr 5.0/2.5  10 switches, code 8.98/463
+
+The v4 change is a directional asymmetry: stepping DOWN carries a long-chain
+EMA into a short chain where it reads as a near-perfect chain (agent-loop
+measures 2.29 accepted drafts at steps=3 but arrives carrying ~4.4), so the
+window must be re-seeded; stepping UP must NOT re-seed, because seeding at 14
+makes every workload look worth 15 steps for a window -- that was v1's 489
+switches.
+
+Free VRAM while serving, mem fraction 0.93: 4.12 GB (sglang) / 3.94 GiB
+(nvidia-smi) vs 4.87 / 4.68 for plain W16; the steps=3 state costs 0.67 GB
+with its graphs pruned to bs=1 (config slot "2" pins bs>=2 to steps=15).
+For a strict 4 GiB floor use W16_MEM_FRACTION=0.925 -> 4.61 GB / 4.40 GiB
+(measured; code-edit 430, prose-en 200, prose-ja 194, agent 272).
+
+Remaining gap: code-edit still spends roughly a quarter of its verifies at
+steps=3 (acc 8.98 vs 11.55 fixed). Its accepted-draft distribution at
+steps=15 is bimodal (full 15-chains interleaved with 0/1), so a 20-batch EMA
+window dips below the 5.0 step-down threshold now and then. The corridor is
+narrow -- agent-loop sits at 3.87 at steps=15 and genuinely wants to leave --
+so closing it needs a smarter statistic than a single EMA (a quantile, or
+per-candidate EMAs), not another threshold.
